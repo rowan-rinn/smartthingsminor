@@ -48,17 +48,17 @@ String getHtmlHeader() {
          "<div class='svg-container'>\n"
          "<svg viewBox='0 0 1080 100' preserveAspectRatio='xMidYMid slice' xmlns='http://www.w3.org/2000/svg' width='100%' height='100'>\n"
          "  <rect style='fill:#ffffff;stroke:none;' width='1080' height='100' />\n"
-         "  <g transform='scale(0.5) translate(450, -90)' style='stroke:none;'>\n"
+         "  <g transform='scale(0.5) translate(580, -90)' style='stroke:none;'>\n"
          "    <path style='fill:#01bf63;stroke:none;' d='m 251.81923,282.83088 c 0,0 -105.37212,1.47718 0.006,-147.22529 105.3786,148.70295 0.006,147.22577 0.006,147.22577' />\n"
          "    <path style='fill:#ffffff;stroke:none;' d='m 210.39692,266.4831 c 0,0 56.52674,5.58289 93.74598,-28.14706 37.21925,-33.72994 0.46524,-37.21924 0.46524,-37.21924 0,0 -44.89571,56.99197 -103.51603,42.80213 -58.62031,-14.18984 9.30481,22.56417 9.30481,22.56417 z' />\n"
          "    <path style='fill:#d8d4d5;stroke:none;' d='m 185.46511,214.04958 c 0,0 -35.50385,51.25721 23.74761,54.07871 0,0 51.25721,2.35125 100.63342,-40.44147 0,0 58.45213,-54.88295 -16.27049,-64.19344 0,0 37.26464,12.18139 6.98072,49.79206 0,0 -23.44561,28.57434 -63.01009,37.61067 0,0 -68.50547,16.67025 -52.08117,-36.84653 z' />\n"
          "    <path style='fill:#ffffff;stroke:none;' d='m 217.44432,204.23819 c 0,0 -10.03344,24.84472 -5.25562,41.88564 l 2.22966,0.31852 c 0,0 -0.47779,-16.40388 3.02596,-42.20416 z' />\n"
          "  </g>\n"
-         "  <text style='font-size:36px;font-family:Futura;font-weight:bold;fill:#241c1c;' x='400' y='60'>\n"
+         "  <text style='font-size:36px;font-family:Futura;font-weight:bold;fill:#241c1c;' x='50%' y='50%' text-anchor='middle' dominant-baseline='middle'>\n"
          "    <tspan style='fill:#605b56;'>Pure</tspan>\n"
          "    <tspan style='fill:#01bf63;'>FIo</tspan>\n"
          "  </text>\n"
-         "  <text style='font-size:12px;font-family:Futura;font-weight:bold;fill:#605b56;' x='410' y='85'>RESIN FILTERS</text>\n"
+         "  <text style='font-size:12px;font-family:Futura;font-weight:bold;fill:#605b56;' x='49%' y='66%' text-anchor='middle' dominant-baseline='middle'>RESIN FILTERS</text>\n"
          "</svg>\n"
          "</div>\n"
          "</div>\n"
@@ -158,6 +158,7 @@ void setup() {
     ESP.restart();
   }
   Serial.println("WiFi verbonden!");
+  Serial.printf("IP-adres: %s\n", WiFi.localIP().toString().c_str());
 
   // Webserver routes
   server.on("/", handleRoot);
@@ -169,11 +170,6 @@ void setup() {
   server.begin();
   Serial.println("Webserver gestart.");
 }
-
-void loop() {
-  server.handleClient(); // Verwerk inkomende HTTP-verzoeken
-}
-
 
 void loop() {
   server.handleClient(); // Verwerk inkomende HTTP-verzoeken
