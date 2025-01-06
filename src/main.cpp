@@ -1,21 +1,15 @@
 #include <Arduino.h>
 #include <SPI.h>
-#if defined(BASE_ESP32)
-    #include <LittleFS.h>
-    #include <WiFi.h>
-    #include <WebServer.h>
-    #include <WiFiManager.h>
-#endif
-#if defined(TFT_CONNECTED)
-    #include <TFT_eSPI.h>
-#endif
+#include <LittleFS.h>
+#include <WiFi.h>
+#include <WebServer.h>
+#include <WiFiManager.h>
+#include <TFT_eSPI.h>
 
-#if defined(BASE_ESP32)
 constexpr const uint8_t TURBIDITY_PIN = 34;           // Analoge pin voor de turbidity-sensor
 constexpr const uint8_t LED_PIN       = LED_BUILTIN;  // GPIO 2 voor de LED
 
 TFT_eSPI tft = TFT_eSPI();
-#endif
 
 WiFiManager wifiManager;
 WebServer   server(80);  // Webserver op poort 80
@@ -179,12 +173,12 @@ void configModeCallback(WiFiManager* myWiFiManager)
 {
     Serial.println("Config mode!");
 
-#if defined(TFT_CONNECTED)
     tft.setTextColor(TFT_YELLOW, TFT_BLACK);
     tft.fillScreen(TFT_BLACK);
     tft.setCursor(0, 0, 2);
-    tft.printf("%s IP-address:\n%s\n", myWiFiManager->getConfigPortalSSID().c_str(), WiFi.softAPIP().toString().c_str());
-#endif
+    tft.printf("%s IP-address:\n%s\n",
+               myWiFiManager->getConfigPortalSSID().c_str(),
+               WiFi.softAPIP().toString().c_str());
     Serial.printf("%s IP-address: %s\n",
                   myWiFiManager->getConfigPortalSSID().c_str(),
                   WiFi.softAPIP().toString().c_str());
@@ -194,19 +188,14 @@ void setup()
 {
     Serial.begin(115200);
     Serial.println("Starting ESP!");
-
-#if defined(TFT_CONNECTED)
     Serial.println("TFT Begin!");
-
     tft.begin();
     tft.setCursor(0, 0, 2);
     tft.setTextColor(TFT_WHITE, TFT_BLACK);
     tft.setTextSize(2);
     tft.setRotation(1);
-
     tft.fillScreen(TFT_BLACK);
     tft.println("TFT Setup Done!");
-#endif
 
     // Pin configuratie
     pinMode(TURBIDITY_PIN, INPUT);
