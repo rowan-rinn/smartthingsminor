@@ -6,13 +6,46 @@
 #include <WiFiManager.h>
 #include <TFT_eSPI.h>
 
-constexpr const uint8_t TURBIDITY_PIN = 34;           // Analoge pin voor de turbidity-sensor
-constexpr const uint8_t LED_PIN       = LED_BUILTIN;  // GPIO 2 voor de LED
+#ifndef TURBIDITY_PIN
+    #define TURBIDITY_PIN (34)  // Analog pin for the turbidity sensor
+#endif
+#ifndef LED_PIN
+    #define LED_PIN (LED_BUILTIN)  // GPIO 2 for the LED
+#endif
+#ifndef TFT_MISO
+    #define TFT_MISO (19)
+#endif
+#ifndef TFT_MOSI
+    #define TFT_MOSI (23)
+#endif
+#ifndef TFT_SCLK
+    #define TFT_SCLK (18)
+#endif
+#ifndef TFT_CS
+    #define TFT_CS (13)
+#endif
+#ifndef TFT_DC
+    #define TFT_DC (12)
+#endif
+#ifndef TFT_RST
+    #define TFT_RST (14)
+#endif
+#ifndef TOUCH_CS
+    #define TOUCH_CS (4)
+#endif
 
-TFT_eSPI tft = TFT_eSPI();
+constexpr static const uint8_t TFT_FONT_STYLE           = 1;
+constexpr static const uint8_t TFT_FONT_SIZE            = TFT_FONT_STYLE == 2 ? 16 : 8;
+constexpr static const uint8_t TFT_FONT_SIZE_MULTIPLIER = TFT_FONT_STYLE == 2 ? 2 : 3;
+static uint8_t                 led_state                = LOW;
+TFT_eSPI                       tft                      = TFT_eSPI();
+WiFiManager                    wifiManager;
+WebServer                      server(80);  // Webserver op poort 80
 
-WiFiManager wifiManager;
-WebServer   server(80);  // Webserver op poort 80
+constexpr const uint16_t to_tft_y(uint8_t row, uint8_t fonst_size_multiplier = TFT_FONT_SIZE_MULTIPLIER)
+{
+    return row * TFT_FONT_SIZE * fonst_size_multiplier;
+}
 
 enum class TFTColor : uint16_t
 {
@@ -35,7 +68,31 @@ TFTColor colors[] = {TFTColor::BLACK,
                      TFTColor::YELLOW,
                      TFTColor::WHITE};
 
-// Functie: HTML-header met CSS en JavaScript voor real-time updates
+void tft_text_setup(uint8_t  row,
+                    uint16_t fg_color   = TFT_WHITE,
+                    uint16_t bg_color   = TFT_BLACK,
+                    uint8_t  font_style = TFT_FONT_STYLE,
+                    uint8_t  font_size  = TFT_FONT_SIZE_MULTIPLIER)
+{
+    tft.setRotation(3);
+    tft.setCursor(0, to_tft_y(row));
+    tft.setTextFont(font_style);
+    tft.setTextColor(fg_color, bg_color);
+    tft.setTextSize(font_size);
+    tft.print("");
+}
+
+void tft_text_reset(uint8_t  row        = 0,
+                    uint16_t fg_color   = TFT_WHITE,
+                    uint16_t bg_color   = TFT_BLACK,
+                    uint8_t  font_style = TFT_FONT_STYLE,
+                    uint8_t  font_size  = TFT_FONT_SIZE_MULTIPLIER)
+{
+    tft.fillScreen(TFT_BLACK);
+    tft_text_setup(row, fg_color, bg_color, font_style, font_size);
+}
+
+// Function: HTML-header with CSS and JavaScript for real-time updates
 String getHtmlHeader()
 {
     return "<!DOCTYPE html>\n"
@@ -95,10 +152,10 @@ String getHtmlHeader()
            "</html>\n";
 }
 
-// Functie: HTML-footer
+// Function: HTML-footer
 String getHtmlFooter() { return "</div></body></html>"; }
 
-// Functie: Hoofdpagina
+// Function: Main Page
 void handleRoot()
 {
     String html = getHtmlHeader();
@@ -119,10 +176,20 @@ void handleRoot()
     server.send(200, "text/html", html);
 }
 
-// Functie: LED Aan
+// Function: Change LED State
+void changeLedState(uint8_t state)
+{
+    if (led_state != state)
+    {
+        digitalWrite(LED_PIN, state);
+        led_state = state;
+    }
+}
+
+// Function: Webserver LED On
 void handleLEDOn()
 {
-    digitalWrite(LED_PIN, HIGH);
+    changeLedState(HIGH);
     String html = getHtmlHeader();
     html +=
         "<h1>LED Status</h1>\
@@ -134,10 +201,10 @@ void handleLEDOn()
     server.send(200, "text/html", html);
 }
 
-// Functie: LED Uit
+// Function: Webserver LED Off
 void handleLEDOff()
 {
-    digitalWrite(LED_PIN, LOW);
+    changeLedState(LOW);
     String html = getHtmlHeader();
     html +=
         "<h1>LED Status</h1>\
@@ -149,15 +216,29 @@ void handleLEDOff()
     server.send(200, "text/html", html);
 }
 
-// Functie: Realtime Turbidity Data (JSON)
-void handleTurbidityData()
+String get_turbidity_data(bool print = true)
 {
-    int   sensorValue = analogRead(TURBIDITY_PIN);
-    float voltage     = sensorValue * (3.3 / 4095.0);
-    float turbidity   = -1120.4 * sq(voltage) + 5742.3 * voltage - 4352.9;
-    if (turbidity < 0) turbidity = 0;
+    uint16_t sensorValue = analogRead(TURBIDITY_PIN);
+    float    voltage     = static_cast<float>(sensorValue) * 3.3F / 4095.0F;
+    float    turbidity   = -1120.4F * sq(voltage) + 5742.3F * voltage - 4352.9F;
+    if (turbidity < 0) { turbidity = 0; }
 
     String json = "{\"turbidity\": " + String(turbidity, 2) + ", \"voltage\": " + String(voltage, 2) + "}";
+
+    if (print)
+    {
+        tft_text_setup(6);
+        tft.printf("Turbidity: %.2f NTU\nVoltage:   %.2f   V\n", turbidity, voltage);
+        Serial.println(json.c_str());
+    }
+
+    return json;
+}
+
+// Function: Realtime Turbidity Data (JSON)
+void handleTurbidityData()
+{
+    String json = get_turbidity_data(false);
     server.send(200, "application/json", json);
 }
 
@@ -172,14 +253,11 @@ void handleWiFiReset()
 void configModeCallback(WiFiManager* myWiFiManager)
 {
     Serial.println("Config mode!");
-
-    tft.setTextColor(TFT_YELLOW, TFT_BLACK);
-    tft.fillScreen(TFT_BLACK);
-    tft.setCursor(0, 0, 2);
-    tft.printf("%s IP-address:\n%s\n",
+    tft_text_setup(2, TFT_YELLOW, TFT_BLACK);
+    tft.printf("Name:\n%s\n\nIP-address:\n%s\n",
                myWiFiManager->getConfigPortalSSID().c_str(),
                WiFi.softAPIP().toString().c_str());
-    Serial.printf("%s IP-address: %s\n",
+    Serial.printf("Name: %s\nIP-address: %s\n",
                   myWiFiManager->getConfigPortalSSID().c_str(),
                   WiFi.softAPIP().toString().c_str());
 }
@@ -190,32 +268,27 @@ void setup()
     Serial.println("Starting ESP!");
     Serial.println("TFT Begin!");
     tft.begin();
-    tft.setCursor(0, 0, 2);
-    tft.setTextColor(TFT_WHITE, TFT_BLACK);
-    tft.setTextSize(2);
-    tft.setRotation(1);
-    tft.fillScreen(TFT_BLACK);
+    tft_text_reset();
     tft.println("TFT Setup Done!");
+    Serial.println("TFT Setup Done!");
 
-    // Pin configuratie
+    // Pin configuration
     pinMode(TURBIDITY_PIN, INPUT);
     pinMode(LED_PIN, OUTPUT);
-    digitalWrite(LED_PIN, LOW);  // Zorg dat LED uit staat bij start
+    digitalWrite(LED_PIN, LOW);  // Make sure the LED is off on startup
+    led_state = LOW;
 
-    tft.fillScreen(TFT_BLACK);
-    tft.setCursor(0, 0, 2);
+    tft_text_reset();
     tft.println("Starting WiFi Manager!");
     Serial.println("Starting WiFi Manager!");
 
-    // Verbinden met WiFi
+    // Connect to WiFi
     wifiManager.setAPCallback(configModeCallback);
     if (wifiManager.autoConnect("ESP32_ConfigPortal"))
     {
-        tft.fillScreen(TFT_BLACK);
-        tft.setTextColor(TFT_GREEN, TFT_BLACK);
-        tft.setCursor(0, 0, 2);
-        tft.printf("WiFi connected!\nIP-address: %s\n", WiFi.localIP().toString().c_str());
-        Serial.printf("WiFi connected!\nIP-address: %s\n", WiFi.localIP().toString().c_str());
+        tft_text_reset(0, TFT_GREEN, TFT_BLACK);
+        tft.printf("WiFi connected!\nWebserver IP-address:\n%s\n", WiFi.localIP().toString().c_str());
+        Serial.printf("WiFi connected!\nWebserver IP-address:\n%s\n", WiFi.localIP().toString().c_str());
     }
 
     // Webserver routes
@@ -226,12 +299,30 @@ void setup()
     server.on("/wifi/reset", handleWiFiReset);
 
     server.begin();
-    tft.setTextColor(TFT_WHITE, TFT_BLACK);
+    tft_text_setup(4, TFT_CYAN, TFT_BLACK);
     tft.println("Webserver started.");
     Serial.println("Webserver started.");
 }
 
 void loop()
 {
-    server.handleClient();  // Verwerk inkomende HTTP-verzoeken
+    uint16_t        x, y;
+    static uint64_t prev_time_turbidity = millis();
+    static uint64_t prev_time_touch     = millis();
+
+    if (millis() - prev_time_turbidity >= 1'000)
+    {
+        prev_time_turbidity = millis();
+        get_turbidity_data();  // Print turbidity data on TFT display
+    }
+
+    if (millis() - prev_time_touch >= 50)
+    {
+        prev_time_touch = millis();
+
+        if (tft.getTouch(&x, &y)) { changeLedState(HIGH); }
+        else { changeLedState(LOW); }
+    }
+
+    server.handleClient();  // Process incoming HTTP requests
 }
