@@ -1,16 +1,45 @@
-#include <Arduino.h>
-#include <SPI.h>
-#include <LittleFS.h>
-#include <WiFi.h>
-#include <WebServer.h>
-#include <WiFiManager.h>
-#include <TFT_eSPI.h>
+#ifndef USER_SETUP_LOADED
+    #define USER_SETUP_LOADED (1)
+#endif
+#ifndef ILI9488_DRIVER
+    #define ILI9488_DRIVER (1)
+#endif
+#ifndef LOAD_GLCD
+    #define LOAD_GLCD (1)
+#endif
+#ifndef LOAD_FONT2
+    #define LOAD_FONT2 (1)
+#endif
+#ifndef LOAD_FONT4
+    #define LOAD_FONT4 (1)
+#endif
+#ifndef LOAD_FONT6
+    #define LOAD_FONT6 (1)
+#endif
+#ifndef LOAD_FONT7
+    #define LOAD_FONT7 (1)
+#endif
+#ifndef LOAD_FONT8
+    #define LOAD_FONT8 (1)
+#endif
+#ifndef LOAD_GFXFF
+    #define LOAD_GFXFF (1)
+#endif
+#ifndef SPI_FREQUENCY
+    #define SPI_FREQUENCY (27000000)
+#endif
+#ifndef SPI_READ_FREQUENCY
+    #define SPI_READ_FREQUENCY (16000000)
+#endif
+#ifndef SPI_TOUCH_FREQUENCY
+    #define SPI_TOUCH_FREQUENCY (2500000)
+#endif
 
 #ifndef TURBIDITY_PIN
     #define TURBIDITY_PIN (34)  // Analog pin for the turbidity sensor
 #endif
 #ifndef LED_PIN
-    #define LED_PIN (LED_BUILTIN)  // GPIO 2 for the LED
+    #define LED_PIN (13)  // GPIO 2 for the LED
 #endif
 #ifndef TFT_MISO
     #define TFT_MISO (19)
@@ -22,17 +51,25 @@
     #define TFT_SCLK (18)
 #endif
 #ifndef TFT_CS
-    #define TFT_CS (13)
+    #define TFT_CS (5)
 #endif
 #ifndef TFT_DC
-    #define TFT_DC (12)
+    #define TFT_DC (2)
 #endif
 #ifndef TFT_RST
-    #define TFT_RST (14)
+    #define TFT_RST (15)
 #endif
 #ifndef TOUCH_CS
     #define TOUCH_CS (4)
 #endif
+
+#include <Arduino.h>
+#include <SPI.h>
+#include <LittleFS.h>
+#include <WiFi.h>
+#include <WebServer.h>
+#include <WiFiManager.h>
+#include <TFT_eSPI.h>
 
 constexpr static const uint8_t TFT_FONT_STYLE           = 1;
 constexpr static const uint8_t TFT_FONT_SIZE            = TFT_FONT_STYLE == 2 ? 16 : 8;
@@ -68,28 +105,20 @@ TFTColor colors[] = {TFTColor::BLACK,
                      TFTColor::YELLOW,
                      TFTColor::WHITE};
 
-void tft_text_setup(uint8_t  row,
-                    uint16_t fg_color   = TFT_WHITE,
-                    uint16_t bg_color   = TFT_BLACK,
-                    uint8_t  font_style = TFT_FONT_STYLE,
-                    uint8_t  font_size  = TFT_FONT_SIZE_MULTIPLIER)
+void tft_text_setup(bool     clear_screen = false,
+                    uint8_t  row          = 0,
+                    uint16_t fg_color     = TFT_WHITE,
+                    uint16_t bg_color     = TFT_BLACK,
+                    uint8_t  font_style   = TFT_FONT_STYLE,
+                    uint8_t  font_size    = TFT_FONT_SIZE_MULTIPLIER)
 {
+    if (clear_screen) { tft.fillScreen(TFT_BLACK); }
     tft.setRotation(3);
     tft.setCursor(0, to_tft_y(row));
     tft.setTextFont(font_style);
     tft.setTextColor(fg_color, bg_color);
     tft.setTextSize(font_size);
     tft.print("");
-}
-
-void tft_text_reset(uint8_t  row        = 0,
-                    uint16_t fg_color   = TFT_WHITE,
-                    uint16_t bg_color   = TFT_BLACK,
-                    uint8_t  font_style = TFT_FONT_STYLE,
-                    uint8_t  font_size  = TFT_FONT_SIZE_MULTIPLIER)
-{
-    tft.fillScreen(TFT_BLACK);
-    tft_text_setup(row, fg_color, bg_color, font_style, font_size);
 }
 
 // Function: HTML-header with CSS and JavaScript for real-time updates
@@ -227,7 +256,7 @@ String get_turbidity_data(bool print = true)
 
     if (print)
     {
-        tft_text_setup(6);
+        tft_text_setup(false, 6);
         tft.printf("Turbidity: %.2f NTU\nVoltage:   %.2f   V\n", turbidity, voltage);
         Serial.println(json.c_str());
     }
@@ -253,7 +282,7 @@ void handleWiFiReset()
 void configModeCallback(WiFiManager* myWiFiManager)
 {
     Serial.println("Config mode!");
-    tft_text_setup(2, TFT_YELLOW, TFT_BLACK);
+    tft_text_setup(false, 2, TFT_YELLOW, TFT_BLACK);
     tft.printf("Name:\n%s\n\nIP-address:\n%s\n",
                myWiFiManager->getConfigPortalSSID().c_str(),
                WiFi.softAPIP().toString().c_str());
@@ -268,7 +297,7 @@ void setup()
     Serial.println("Starting ESP!");
     Serial.println("TFT Begin!");
     tft.begin();
-    tft_text_reset();
+    tft_text_setup(true);
     tft.println("TFT Setup Done!");
     Serial.println("TFT Setup Done!");
 
@@ -278,7 +307,7 @@ void setup()
     digitalWrite(LED_PIN, LOW);  // Make sure the LED is off on startup
     led_state = LOW;
 
-    tft_text_reset();
+    tft_text_setup(true);
     tft.println("Starting WiFi Manager!");
     Serial.println("Starting WiFi Manager!");
 
@@ -286,7 +315,7 @@ void setup()
     wifiManager.setAPCallback(configModeCallback);
     if (wifiManager.autoConnect("ESP32_ConfigPortal"))
     {
-        tft_text_reset(0, TFT_GREEN, TFT_BLACK);
+        tft_text_setup(true, 0, TFT_GREEN, TFT_BLACK);
         tft.printf("WiFi connected!\nWebserver IP-address:\n%s\n", WiFi.localIP().toString().c_str());
         Serial.printf("WiFi connected!\nWebserver IP-address:\n%s\n", WiFi.localIP().toString().c_str());
     }
@@ -299,7 +328,7 @@ void setup()
     server.on("/wifi/reset", handleWiFiReset);
 
     server.begin();
-    tft_text_setup(4, TFT_CYAN, TFT_BLACK);
+    tft_text_setup(false, 4, TFT_CYAN, TFT_BLACK);
     tft.println("Webserver started.");
     Serial.println("Webserver started.");
 }
