@@ -1,68 +1,3 @@
-#ifndef USER_SETUP_LOADED
-    #define USER_SETUP_LOADED (1)
-#endif
-#ifndef ILI9488_DRIVER
-    #define ILI9488_DRIVER (1)
-#endif
-#ifndef LOAD_GLCD
-    #define LOAD_GLCD (1)
-#endif
-#ifndef LOAD_FONT2
-    #define LOAD_FONT2 (1)
-#endif
-#ifndef LOAD_FONT4
-    #define LOAD_FONT4 (1)
-#endif
-#ifndef LOAD_FONT6
-    #define LOAD_FONT6 (1)
-#endif
-#ifndef LOAD_FONT7
-    #define LOAD_FONT7 (1)
-#endif
-#ifndef LOAD_FONT8
-    #define LOAD_FONT8 (1)
-#endif
-#ifndef LOAD_GFXFF
-    #define LOAD_GFXFF (1)
-#endif
-#ifndef SPI_FREQUENCY
-    #define SPI_FREQUENCY (27000000)
-#endif
-#ifndef SPI_READ_FREQUENCY
-    #define SPI_READ_FREQUENCY (16000000)
-#endif
-#ifndef SPI_TOUCH_FREQUENCY
-    #define SPI_TOUCH_FREQUENCY (2500000)
-#endif
-
-#ifndef TURBIDITY_PIN
-    #define TURBIDITY_PIN (34)  // Analog pin for the turbidity sensor
-#endif
-#ifndef LED_PIN
-    #define LED_PIN (13)  // GPIO 2 for the LED
-#endif
-#ifndef TFT_MISO
-    #define TFT_MISO (19)
-#endif
-#ifndef TFT_MOSI
-    #define TFT_MOSI (23)
-#endif
-#ifndef TFT_SCLK
-    #define TFT_SCLK (18)
-#endif
-#ifndef TFT_CS
-    #define TFT_CS (5)
-#endif
-#ifndef TFT_DC
-    #define TFT_DC (2)
-#endif
-#ifndef TFT_RST
-    #define TFT_RST (15)
-#endif
-#ifndef TOUCH_CS
-    #define TOUCH_CS (4)
-#endif
-
 #include <Arduino.h>
 #include <SPI.h>
 #include <LittleFS.h>
@@ -71,11 +6,14 @@
 #include <WiFiManager.h>
 #include <TFT_eSPI.h>
 
-constexpr static const uint8_t TFT_FONT_STYLE           = 1;
-constexpr static const uint8_t TFT_FONT_SIZE            = TFT_FONT_STYLE == 2 ? 16 : 8;
-constexpr static const uint8_t TFT_FONT_SIZE_MULTIPLIER = TFT_FONT_STYLE == 2 ? 2 : 3;
-static uint8_t                 led_state                = LOW;
-TFT_eSPI                       tft                      = TFT_eSPI();
+constexpr static const float   TURBIDITY_SENSOR_INPUT_VOLTAGE = 3.3F;
+constexpr static const uint8_t TFT_FONT_STYLE                 = 1;
+constexpr static const uint8_t TFT_FONT_SIZE                  = TFT_FONT_STYLE == 2 ? 16 : 8;
+constexpr static const uint8_t TFT_FONT_SIZE_MULTIPLIER       = TFT_FONT_STYLE == 2 ? 2 : 3;
+static uint8_t                 led_state                      = LOW;
+static bool                    pump_state                     = false;
+static String                  WEBSERVER_IP_ADDRESS_TEXT      = "";
+TFT_eSPI                       tft                            = TFT_eSPI();
 WiFiManager                    wifiManager;
 WebServer                      server(80);  // Webserver op poort 80
 
@@ -105,6 +43,13 @@ TFTColor colors[] = {TFTColor::BLACK,
                      TFTColor::YELLOW,
                      TFTColor::WHITE};
 
+void tft_clear_row(uint8_t  row,
+                   uint8_t  font_size_height = TFT_FONT_SIZE * TFT_FONT_SIZE_MULTIPLIER,
+                   uint16_t color            = TFT_BLACK)
+{
+    tft.fillRect(0, to_tft_y(row), tft.width(), font_size_height, color);
+}
+
 void tft_text_setup(bool     clear_screen = false,
                     uint8_t  row          = 0,
                     uint16_t fg_color     = TFT_WHITE,
@@ -118,7 +63,6 @@ void tft_text_setup(bool     clear_screen = false,
     tft.setTextFont(font_style);
     tft.setTextColor(fg_color, bg_color);
     tft.setTextSize(font_size);
-    tft.print("");
 }
 
 // Function: HTML-header with CSS and JavaScript for real-time updates
@@ -198,7 +142,7 @@ void handleRoot()
              <h2>Realtime Turbidity</h2>\
              <p><strong>Turbidity:</strong> <span id='turbidity'>Laden...</span></p>\
              <p><strong>Voltage:</strong> <span id='voltage'>Laden...</span></p>\
-             <p><strong>Tijd:</strong> <span id='time'>" + String(millis() / 1000) + " sec</span></p>\
+             <p><strong>Tijd:</strong> <span id='time'>" + String(millis() / 1'000) + " sec</span></p>\
              <p><a href='/wifi/reset' class='link'><button>Reset Wi-Fi Instellingen</button></a></p>\
            </div>";
     html += getHtmlFooter();
@@ -245,10 +189,10 @@ void handleLEDOff()
     server.send(200, "text/html", html);
 }
 
-String get_turbidity_data(bool print = true)
+String get_turbidity_data(bool print = true, uint8_t row = 4)
 {
     uint16_t sensorValue = analogRead(TURBIDITY_PIN);
-    float    voltage     = static_cast<float>(sensorValue) * 3.3F / 4095.0F;
+    float    voltage     = static_cast<float>(sensorValue) * TURBIDITY_SENSOR_INPUT_VOLTAGE / 4095.0F;
     float    turbidity   = -1120.4F * sq(voltage) + 5742.3F * voltage - 4352.9F;
     if (turbidity < 0) { turbidity = 0; }
 
@@ -256,8 +200,10 @@ String get_turbidity_data(bool print = true)
 
     if (print)
     {
-        tft_text_setup(false, 6);
-        tft.printf("Turbidity: %.2f NTU\nVoltage:   %.2f   V\n", turbidity, voltage);
+        tft_text_setup(false, row);
+        tft_clear_row(row);
+        tft_clear_row(row + 1);
+        tft.printf("Turbidity: %.2f NTU\nVoltage:   %.2f V\n", turbidity, voltage);
         Serial.println(json.c_str());
     }
 
@@ -274,7 +220,7 @@ void handleTurbidityData()
 void handleWiFiReset()
 {
     server.send(200, "text/html", "<h1>Wi-Fi Reset</h1><p>De Wi-Fi-instellingen worden gereset...</p>");
-    delay(2000);
+    delay(2'000);
     wifiManager.resetSettings();
     ESP.restart();
 }
@@ -289,6 +235,41 @@ void configModeCallback(WiFiManager* myWiFiManager)
     Serial.printf("Name: %s\nIP-address: %s\n",
                   myWiFiManager->getConfigPortalSSID().c_str(),
                   WiFi.softAPIP().toString().c_str());
+}
+
+void display_button(const char* text,
+                    uint16_t    x,
+                    uint16_t    y,
+                    uint16_t    w,
+                    uint16_t    h,
+                    uint16_t    bg_color,
+                    uint16_t    fg_color = TFT_WHITE)
+{
+    tft.fillRoundRect(x, y, w, h, 8, bg_color);
+    tft.drawRoundRect(x, y, w, h, 8, TFT_BLACK);
+    tft.setTextColor(fg_color);
+    tft.setTextSize(2);
+    tft.setTextDatum(MC_DATUM);
+    tft.drawString(text, x + w / 2, y + h / 2);
+}
+
+bool is_button_pressed(uint16_t touch_x, uint16_t touch_y, uint16_t x, uint16_t y, uint16_t w, uint16_t h)
+{
+    uint16_t x1 = x;
+    uint16_t y1 = y;
+    uint16_t x2 = x + w;
+    uint16_t y2 = y + h;
+
+    return touch_x >= x1 && touch_x <= x2 && touch_y >= y1 && touch_y <= y2;
+}
+
+void update_buttons(uint16_t touch_x, uint16_t touch_y)
+{
+    bool button_on_pressed  = is_button_pressed(touch_x, touch_y, 20, 220, 180, 80);
+    bool button_off_pressed = is_button_pressed(touch_x, touch_y, 280, 220, 180, 80);
+    pump_state              = (button_on_pressed && !button_off_pressed)   ? true
+                              : (button_off_pressed && !button_on_pressed) ? false
+                                                                           : pump_state;
 }
 
 void setup()
@@ -316,8 +297,9 @@ void setup()
     if (wifiManager.autoConnect("ESP32_ConfigPortal"))
     {
         tft_text_setup(true, 0, TFT_GREEN, TFT_BLACK);
-        tft.printf("WiFi connected!\nWebserver IP-address:\n%s\n", WiFi.localIP().toString().c_str());
-        Serial.printf("WiFi connected!\nWebserver IP-address:\n%s\n", WiFi.localIP().toString().c_str());
+        WEBSERVER_IP_ADDRESS_TEXT = "Webserver IP-address:\n" + WiFi.localIP().toString();
+        tft.printf("%s\n%s", "WiFi connected!", WEBSERVER_IP_ADDRESS_TEXT.c_str());
+        Serial.printf("%s\n%s", "WiFi connected!", WEBSERVER_IP_ADDRESS_TEXT.c_str());
     }
 
     // Webserver routes
@@ -328,29 +310,45 @@ void setup()
     server.on("/wifi/reset", handleWiFiReset);
 
     server.begin();
-    tft_text_setup(false, 4, TFT_CYAN, TFT_BLACK);
+    tft_text_setup(false, 0, TFT_GREEN, TFT_BLACK);
     tft.println("Webserver started.");
     Serial.println("Webserver started.");
+
+    display_button("ON", 20, 220, 180, 80, TFT_GREEN, TFT_BLACK);
+    display_button("OFF", 280, 220, 180, 80, TFT_RED, TFT_BLACK);
 }
 
 void loop()
 {
-    uint16_t        x, y;
+    uint16_t        touch_x, touch_y;
+    static uint16_t prev_x, prev_y;
     static uint64_t prev_time_turbidity = millis();
     static uint64_t prev_time_touch     = millis();
 
-    if (millis() - prev_time_turbidity >= 1'000)
+    if (millis() - prev_time_turbidity >= 500)
     {
         prev_time_turbidity = millis();
-        get_turbidity_data();  // Print turbidity data on TFT display
+        get_turbidity_data(true, 4);  // Print turbidity data on TFT display
     }
 
-    if (millis() - prev_time_touch >= 50)
+    if (millis() - prev_time_touch >= 20)
     {
         prev_time_touch = millis();
 
-        if (tft.getTouch(&x, &y)) { changeLedState(HIGH); }
-        else { changeLedState(LOW); }
+        update_buttons(prev_x, prev_y);
+
+        if (tft.getTouch(&touch_x, &touch_y))
+        {
+            changeLedState(pump_state ? HIGH : LOW);
+            prev_x = touch_x;
+            prev_y = touch_y;
+
+            tft_text_setup(false, 7, TFT_ORANGE, TFT_BLACK);
+            tft.printf("Pump State:\n");
+            tft_clear_row(8);
+            tft_text_setup(false, 8, pump_state ? TFT_GREEN : TFT_RED);
+            tft.printf("%s", pump_state ? "ON" : "OFF");
+        }
     }
 
     server.handleClient();  // Process incoming HTTP requests
