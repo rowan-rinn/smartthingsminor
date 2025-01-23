@@ -48,27 +48,6 @@ constexpr const uint16_t to_tft_y(uint8_t row, uint8_t fonst_size_multiplier = T
     return row * TFT_FONT_SIZE * fonst_size_multiplier;
 }
 
-enum class TFTColor : uint16_t
-{
-    BLACK   = TFT_BLACK,
-    BLUE    = TFT_BLUE,
-    RED     = TFT_RED,
-    GREEN   = TFT_GREEN,
-    CYAN    = TFT_CYAN,
-    MAGENTA = TFT_MAGENTA,
-    YELLOW  = TFT_YELLOW,
-    WHITE   = TFT_WHITE
-};
-
-TFTColor colors[] = {TFTColor::BLACK,
-                     TFTColor::BLUE,
-                     TFTColor::RED,
-                     TFTColor::GREEN,
-                     TFTColor::CYAN,
-                     TFTColor::MAGENTA,
-                     TFTColor::YELLOW,
-                     TFTColor::WHITE};
-
 void tft_clear_row(uint8_t  row,
                    uint8_t  font_size_height = TFT_FONT_SIZE * TFT_FONT_SIZE_MULTIPLIER,
                    uint16_t color            = TFT_BLACK)
