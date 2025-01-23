@@ -5,17 +5,43 @@
 #include <WebServer.h>
 #include <WiFiManager.h>
 #include <TFT_eSPI.h>
+#include <AccelStepper.h>
 
-constexpr static const float   TURBIDITY_SENSOR_INPUT_VOLTAGE = 3.3F;
-constexpr static const uint8_t TFT_FONT_STYLE                 = 1;
-constexpr static const uint8_t TFT_FONT_SIZE                  = TFT_FONT_STYLE == 2 ? 16 : 8;
-constexpr static const uint8_t TFT_FONT_SIZE_MULTIPLIER       = TFT_FONT_STYLE == 2 ? 2 : 3;
-static uint8_t                 led_state                      = LOW;
-static bool                    pump_state                     = false;
-static String                  WEBSERVER_IP_ADDRESS_TEXT      = "";
-TFT_eSPI                       tft                            = TFT_eSPI();
-WiFiManager                    wifiManager;
-WebServer                      server(80);  // Webserver op poort 80
+constexpr static const uint8_t  TFT_FONT_SIZE             = TFT_FONT_STYLE == 2 ? 16 : 8;
+constexpr static const uint8_t  TFT_FONT_SIZE_MULTIPLIER  = TFT_FONT_STYLE == 2 ? 2 : 3;
+constexpr static const uint8_t  MOTOR_MICROSTEPS          = 1;
+constexpr static const uint16_t MOTOR_RPM                 = 20;
+static String                   WEBSERVER_IP_ADDRESS_TEXT = "";
+static String                   WEBSERVER_TURBIDITY_DATA  = "";
+static String                   TFT_TURBIDITY_DATA        = "";
+static float                    tft_prev_turbidity        = -1.0F;
+static float                    ws_prev_turbidity         = -1.0F;
+static uint8_t                  led_state                 = LOW;
+static bool                     pump_state                = false;
+
+/**
+ * @brief AccelStepper object, providing the motor control functionality
+ * 
+ */
+AccelStepper stepper(AccelStepper::DRIVER, MOTOR_STEP_PIN, MOTOR_DIRECTION_PIN);
+
+/**
+ * @brief TFT_eSPI object, providing the display functionality
+ * 
+ */
+TFT_eSPI tft = TFT_eSPI();
+
+/**
+ * @brief WiFiManager object, providing the WiFi connection functionality
+ * 
+ */
+WiFiManager wifiManager;
+
+/**
+ * @brief WebServer object, providing the web server functionality
+ * 
+ */
+WebServer server(WEBSERVER_PORT);
 
 constexpr const uint16_t to_tft_y(uint8_t row, uint8_t fonst_size_multiplier = TFT_FONT_SIZE_MULTIPLIER)
 {
@@ -63,6 +89,76 @@ void tft_text_setup(bool     clear_screen = false,
     tft.setTextFont(font_style);
     tft.setTextColor(fg_color, bg_color);
     tft.setTextSize(font_size);
+}
+
+void display_pump_state(uint8_t row = 7)
+{
+    tft_text_setup(false, row, TFT_ORANGE, TFT_BLACK);
+    tft.printf("Pump State:\n");
+    tft_clear_row(row + 1);
+    tft_text_setup(false, row + 1, pump_state ? TFT_GREEN : TFT_RED);
+    tft.printf("%s", pump_state ? "ON" : "OFF");
+}
+
+// Function: Change LED State
+void changeLedState(uint8_t state)
+{
+    if (led_state != state)
+    {
+        digitalWrite(LED_PIN, state);
+        led_state = state;
+    }
+}
+
+// Function: Change Pump State
+void changePumpState(bool state)
+{
+    if (pump_state != state)
+    {
+        pump_state = state;
+        changeLedState(state ? HIGH : LOW);
+        display_pump_state(7);
+
+        if (state)
+        {
+            Serial.println("MOTOR START");
+            stepper.setSpeed(MOTOR_RPM * MOTOR_STEPS_PER_REV * MOTOR_MICROSTEPS);
+            stepper.runSpeed();
+        }
+        else
+        {
+            Serial.println("MOTOR STOP");
+            stepper.setSpeed(0);
+            stepper.stop();
+        }
+    }
+}
+
+bool get_turbidity_data(float& prev_turbidity, bool serial_print = false, bool tft_print = true, uint8_t row = 4)
+{
+    uint16_t curr_sensor_value = analogRead(TURBIDITY_PIN);
+    float    voltage           = (TURBIDITY_SENSOR_INPUT_VOLTAGE * static_cast<float>(curr_sensor_value)) / 4095.0F;
+    float    turbidity_raw     = -1120.4F * sq(voltage) + 5742.3F * voltage - 4352.9F;
+    float    turbidity         = turbidity_raw < 0 ? 0 : turbidity_raw;
+    bool     new_data          = abs(turbidity - prev_turbidity) > 0.0F;
+
+    if (!new_data) { return false; }
+
+    WEBSERVER_TURBIDITY_DATA = "{\"turbidity\": " + String(turbidity, 2) + ", \"voltage\": " + String(voltage, 2) + "}";
+    TFT_TURBIDITY_DATA       = "Turbidity: " + String(turbidity, 2) + " NTU\nVoltage:   " + String(voltage, 2) + " V";
+
+    if (tft_print && new_data)
+    {
+        prev_turbidity = turbidity;
+        tft_text_setup(false, row);
+        tft_clear_row(row);
+        tft_clear_row(row + 1);
+        tft.println(TFT_TURBIDITY_DATA.c_str());
+
+        if (serial_print) { Serial.println(WEBSERVER_TURBIDITY_DATA.c_str()); }
+    }
+
+    return true;
 }
 
 // Function: HTML-header with CSS and JavaScript for real-time updates
@@ -134,107 +230,66 @@ void handleRoot()
     String html = getHtmlHeader();
     html += "<h1>ESP32 Webinterface</h1>\
            <div class='card'>\
-             <p>Controleer de LED-status of bekijk turbidity-informatie:</p>\
-             <p><a href='/led/on' class='link'><button>LED Aan</button></a></p>\
-             <p><a href='/led/off' class='link'><button>LED Uit</button></a></p>\
+             <p>Control the Pump state or check the turbidity values:</p>\
+             <p><a href='/pump/on' class='link'><button>Pump ON</button></a></p>\
+             <p><a href='/pump/off' class='link'><button>Pump OFF</button></a></p>\
            </div>\
            <div class='card'>\
              <h2>Realtime Turbidity</h2>\
              <p><strong>Turbidity:</strong> <span id='turbidity'>Laden...</span></p>\
              <p><strong>Voltage:</strong> <span id='voltage'>Laden...</span></p>\
-             <p><strong>Tijd:</strong> <span id='time'>" + String(millis() / 1'000) + " sec</span></p>\
-             <p><a href='/wifi/reset' class='link'><button>Reset Wi-Fi Instellingen</button></a></p>\
+             <p><strong>Time:</strong> <span id='time'>" + String(millis() / 1'000) + " sec</span></p>\
+             <p><a href='/wifi/reset' class='link'><button>Reset Wi-Fi Settings</button></a></p>\
            </div>";
     html += getHtmlFooter();
     server.send(200, "text/html", html);
 }
 
-// Function: Change LED State
-void changeLedState(uint8_t state)
-{
-    if (led_state != state)
-    {
-        digitalWrite(LED_PIN, state);
-        led_state = state;
-    }
-}
-
 // Function: Webserver LED On
-void handleLEDOn()
+void handlePumpOn()
 {
-    changeLedState(HIGH);
+    changePumpState(true);
     String html = getHtmlHeader();
     html +=
-        "<h1>LED Status</h1>\
+        "<h1>Pump Status</h1>\
            <div class='card'>\
-             <p>De LED is <strong>AAN</strong>.</p>\
-             <p><a href='/' class='link'><button>Terug naar Hoofdmenu</button></a></p>\
+             <p>The pump is now <strong>ON</strong>.</p>\
+             <p><a href='/' class='link'><button>Back to Home</button></a></p>\
            </div>";
     html += getHtmlFooter();
     server.send(200, "text/html", html);
 }
 
 // Function: Webserver LED Off
-void handleLEDOff()
+void handlePumpOff()
 {
-    changeLedState(LOW);
+    changePumpState(false);
     String html = getHtmlHeader();
     html +=
-        "<h1>LED Status</h1>\
+        "<h1>Pump Status</h1>\
            <div class='card'>\
-             <p>De LED is <strong>UIT</strong>.</p>\
-             <p><a href='/' class='link'><button>Terug naar Hoofdmenu</button></a></p>\
+             <p>The pump is now <strong>OFF</strong>.</p>\
+             <p><a href='/' class='link'><button>Back to Home</button></a></p>\
            </div>";
     html += getHtmlFooter();
     server.send(200, "text/html", html);
 }
 
-String get_turbidity_data(bool print = true, uint8_t row = 4)
-{
-    uint16_t sensorValue = analogRead(TURBIDITY_PIN);
-    float    voltage     = static_cast<float>(sensorValue) * TURBIDITY_SENSOR_INPUT_VOLTAGE / 4095.0F;
-    float    turbidity   = -1120.4F * sq(voltage) + 5742.3F * voltage - 4352.9F;
-    if (turbidity < 0) { turbidity = 0; }
-
-    String json = "{\"turbidity\": " + String(turbidity, 2) + ", \"voltage\": " + String(voltage, 2) + "}";
-
-    if (print)
-    {
-        tft_text_setup(false, row);
-        tft_clear_row(row);
-        tft_clear_row(row + 1);
-        tft.printf("Turbidity: %.2f NTU\nVoltage:   %.2f V\n", turbidity, voltage);
-        Serial.println(json.c_str());
-    }
-
-    return json;
-}
-
 // Function: Realtime Turbidity Data (JSON)
 void handleTurbidityData()
 {
-    String json = get_turbidity_data(false);
-    server.send(200, "application/json", json);
+    if (get_turbidity_data(ws_prev_turbidity, false, false, 4))
+    {
+        server.send(200, "application/json", WEBSERVER_TURBIDITY_DATA);
+    }
 }
 
 void handleWiFiReset()
 {
-    server.send(200, "text/html", "<h1>Wi-Fi Reset</h1><p>De Wi-Fi-instellingen worden gereset...</p>");
+    server.send(200, "text/html", "<h1>Wi-Fi Reset</h1><p>Wi-Fi settings are being reset...</p>");
     delay(2'000);
     wifiManager.resetSettings();
     ESP.restart();
-}
-
-void configModeCallback(WiFiManager* myWiFiManager)
-{
-    Serial.println("Config mode!");
-    tft_text_setup(false, 2, TFT_YELLOW, TFT_BLACK);
-    tft.printf("Name:\n%s\n\nIP-address:\n%s\n",
-               myWiFiManager->getConfigPortalSSID().c_str(),
-               WiFi.softAPIP().toString().c_str());
-    Serial.printf("Name: %s\nIP-address: %s\n",
-                  myWiFiManager->getConfigPortalSSID().c_str(),
-                  WiFi.softAPIP().toString().c_str());
 }
 
 void display_button(const char* text,
@@ -267,9 +322,41 @@ void update_buttons(uint16_t touch_x, uint16_t touch_y)
 {
     bool button_on_pressed  = is_button_pressed(touch_x, touch_y, 20, 220, 180, 80);
     bool button_off_pressed = is_button_pressed(touch_x, touch_y, 280, 220, 180, 80);
-    pump_state              = (button_on_pressed && !button_off_pressed)   ? true
+    bool result             = (button_on_pressed && !button_off_pressed)   ? true
                               : (button_off_pressed && !button_on_pressed) ? false
                                                                            : pump_state;
+
+    changePumpState(result);
+}
+
+void configModeCallback(WiFiManager* myWiFiManager)
+{
+    Serial.println("Config mode!");
+    tft_text_setup(false, 2, TFT_YELLOW, TFT_BLACK);
+    tft.printf("Name:\n%s\n\nIP-address:\n%s\n",
+               myWiFiManager->getConfigPortalSSID().c_str(),
+               WiFi.softAPIP().toString().c_str());
+    Serial.printf("Name: %s\nIP-address: %s\n",
+                  myWiFiManager->getConfigPortalSSID().c_str(),
+                  WiFi.softAPIP().toString().c_str());
+}
+
+void init_motor()
+{
+    Serial.println("PUMP INIT");
+
+    pinMode(MOTOR_MS1_PIN, OUTPUT);  // Microstep1 pin as output
+    pinMode(MOTOR_MS2_PIN, OUTPUT);  // Microstep2 pin as output
+    pinMode(MOTOR_MS3_PIN, OUTPUT);  // Microstep3 pin as output
+
+    digitalWrite(MOTOR_MS1_PIN, LOW);  // Set microstep1 pin to low
+    digitalWrite(MOTOR_MS2_PIN, LOW);  // Set microstep2 pin to low
+    digitalWrite(MOTOR_MS3_PIN, LOW);  // Set microstep3 pin to low
+
+    stepper.setMaxSpeed(static_cast<float>(MOTOR_RPM * MOTOR_STEPS_PER_REV * MOTOR_MICROSTEPS));
+
+    Serial.println("PUMP START");
+    changePumpState(pump_state);
 }
 
 void setup()
@@ -305,8 +392,8 @@ void setup()
     // Webserver routes
     server.on("/", handleRoot);
     server.on("/turbidity/data", handleTurbidityData);  // Realtime data endpoint
-    server.on("/led/on", handleLEDOn);
-    server.on("/led/off", handleLEDOff);
+    server.on("/pump/on", handlePumpOn);
+    server.on("/pump/off", handlePumpOff);
     server.on("/wifi/reset", handleWiFiReset);
 
     server.begin();
@@ -314,42 +401,49 @@ void setup()
     tft.println("Webserver started.");
     Serial.println("Webserver started.");
 
+    get_turbidity_data(tft_prev_turbidity, false, true, 4);  // Print turbidity data (only on TFT display)
+
+    display_pump_state(7);
     display_button("ON", 20, 220, 180, 80, TFT_GREEN, TFT_BLACK);
     display_button("OFF", 280, 220, 180, 80, TFT_RED, TFT_BLACK);
+
+    init_motor();
 }
 
 void loop()
 {
     uint16_t        touch_x, touch_y;
     static uint16_t prev_x, prev_y;
-    static uint64_t prev_time_turbidity = millis();
-    static uint64_t prev_time_touch     = millis();
+    static uint64_t prev_time_turbidity = micros();
+    static uint64_t prev_time_server    = micros();
+    static uint64_t prev_time_touch     = micros();
 
-    if (millis() - prev_time_turbidity >= 500)
+    // Motor control
+    if (pump_state) { stepper.runSpeed(); }
+
+    if (micros() - prev_time_touch >= 10'000)
     {
-        prev_time_turbidity = millis();
-        get_turbidity_data(true, 4);  // Print turbidity data on TFT display
-    }
-
-    if (millis() - prev_time_touch >= 20)
-    {
-        prev_time_touch = millis();
-
-        update_buttons(prev_x, prev_y);
+        prev_time_touch = micros();
 
         if (tft.getTouch(&touch_x, &touch_y))
         {
-            changeLedState(pump_state ? HIGH : LOW);
             prev_x = touch_x;
             prev_y = touch_y;
 
-            tft_text_setup(false, 7, TFT_ORANGE, TFT_BLACK);
-            tft.printf("Pump State:\n");
-            tft_clear_row(8);
-            tft_text_setup(false, 8, pump_state ? TFT_GREEN : TFT_RED);
-            tft.printf("%s", pump_state ? "ON" : "OFF");
+            update_buttons(prev_x, prev_y);
+            display_pump_state(7);
         }
     }
 
-    server.handleClient();  // Process incoming HTTP requests
+    if (micros() - prev_time_server >= 10'000)
+    {
+        prev_time_server = micros();
+        server.handleClient();  // Process incoming HTTP requests
+    }
+
+    if (micros() - prev_time_turbidity >= 1'000'000)
+    {
+        prev_time_turbidity = micros();
+        get_turbidity_data(tft_prev_turbidity, false, true, 4);  // Print turbidity data
+    }
 }
