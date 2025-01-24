@@ -11,13 +11,14 @@ constexpr static const uint8_t  TFT_FONT_SIZE             = TFT_FONT_STYLE == 2 
 constexpr static const uint8_t  TFT_FONT_SIZE_MULTIPLIER  = TFT_FONT_STYLE == 2 ? 2 : 3;
 constexpr static const uint8_t  MOTOR_MICROSTEPS          = 1;
 constexpr static const uint16_t MOTOR_RPM                 = 20;
+constexpr static const bool     PUMP_STATE_DEFAULT        = false;
 static String                   WEBSERVER_IP_ADDRESS_TEXT = "";
 static String                   WEBSERVER_TURBIDITY_DATA  = "";
 static String                   TFT_TURBIDITY_DATA        = "";
 static float                    tft_prev_turbidity        = -1.0F;
 static float                    ws_prev_turbidity         = -1.0F;
 static uint8_t                  led_state                 = LOW;
-static bool                     pump_state                = false;
+static bool                     pump_state                = PUMP_STATE_DEFAULT;
 
 /**
  * @brief AccelStepper object, providing the motor control functionality
@@ -42,6 +43,48 @@ WiFiManager wifiManager;
  * 
  */
 WebServer server(WEBSERVER_PORT);
+
+TaskHandle_t      get_data_task_handle  = NULL;
+TaskHandle_t      motor_task_handle     = NULL;
+TaskHandle_t      tft_touch_task_handle = NULL;
+TaskHandle_t      webserver_task_handle = NULL;
+SemaphoreHandle_t semaphore_pump_state  = NULL;
+
+bool get_pump_state(bool& dest)
+{
+    if (semaphore_pump_state != NULL)
+    {
+        if (xSemaphoreTake(semaphore_pump_state, 2) == pdTRUE)
+        {
+            dest = pump_state;
+            xSemaphoreGive(semaphore_pump_state);
+
+            return true;
+        }
+        else { log_w("Could not take semaphore_pump_state"); }
+    }
+    else { log_w("semaphore_pump_state is NULL"); }
+
+    return false;
+}
+
+bool set_pump_state(bool state)
+{
+    if (semaphore_pump_state != NULL)
+    {
+        if (xSemaphoreTake(semaphore_pump_state, static_cast<TickType_t>(100 / portTICK_PERIOD_MS)) == pdTRUE)
+        {
+            pump_state = state;
+            xSemaphoreGive(semaphore_pump_state);
+
+            return true;
+        }
+        else { log_w("Could not take semaphore_pump_state"); }
+    }
+    else { log_w("semaphore_pump_state is NULL"); }
+
+    return false;
+}
 
 constexpr const uint16_t to_tft_y(uint8_t row, uint8_t fonst_size_multiplier = TFT_FONT_SIZE_MULTIPLIER)
 {
@@ -75,8 +118,14 @@ void display_pump_state(uint8_t row = 7)
     tft_text_setup(false, row, TFT_ORANGE, TFT_BLACK);
     tft.printf("Pump State:\n");
     tft_clear_row(row + 1);
-    tft_text_setup(false, row + 1, pump_state ? TFT_GREEN : TFT_RED);
-    tft.printf("%s", pump_state ? "ON" : "OFF");
+
+    bool pump_state_local;
+    if (get_pump_state(pump_state_local))
+    {
+        tft_text_setup(false, row + 1, pump_state_local ? TFT_GREEN : TFT_RED);
+        tft.printf("%s", pump_state_local ? "ON" : "OFF");
+    }
+    else { log_w("get_pump_state failed!"); }
 }
 
 // Function: Change LED State
@@ -92,25 +141,33 @@ void changeLedState(uint8_t state)
 // Function: Change Pump State
 void changePumpState(bool state)
 {
-    if (pump_state != state)
+    bool pump_state_local;
+    if (get_pump_state(pump_state_local))
     {
-        pump_state = state;
-        changeLedState(state ? HIGH : LOW);
-        display_pump_state(7);
+        if (pump_state_local != state)
+        {
+            if (set_pump_state(state))
+            {
+                changeLedState(state ? HIGH : LOW);
+                display_pump_state(7);
 
-        if (state)
-        {
-            Serial.println("MOTOR START");
-            stepper.setSpeed(MOTOR_RPM * MOTOR_STEPS_PER_REV * MOTOR_MICROSTEPS);
-            stepper.runSpeed();
-        }
-        else
-        {
-            Serial.println("MOTOR STOP");
-            stepper.setSpeed(0);
-            stepper.stop();
+                if (state)
+                {
+                    Serial.println("MOTOR START");
+                    stepper.setSpeed(MOTOR_RPM * MOTOR_STEPS_PER_REV * MOTOR_MICROSTEPS);
+                    stepper.runSpeed();
+                }
+                else
+                {
+                    Serial.println("MOTOR STOP");
+                    stepper.setSpeed(0);
+                    stepper.stop();
+                }
+            }
+            else { log_w("set_pump_state failed!"); }
         }
     }
+    else { log_w("get_pump_state failed!"); }
 }
 
 bool get_turbidity_data(float& prev_turbidity, bool serial_print = false, bool tft_print = true, uint8_t row = 4)
@@ -271,6 +328,18 @@ void handleWiFiReset()
     ESP.restart();
 }
 
+void configModeCallback(WiFiManager* myWiFiManager)
+{
+    Serial.println("Config mode!");
+    tft_text_setup(false, 2, TFT_YELLOW, TFT_BLACK);
+    tft.printf("Name:\n%s\n\nIP-address:\n%s\n",
+               myWiFiManager->getConfigPortalSSID().c_str(),
+               WiFi.softAPIP().toString().c_str());
+    Serial.printf("Name: %s\nIP-address: %s\n",
+                  myWiFiManager->getConfigPortalSSID().c_str(),
+                  WiFi.softAPIP().toString().c_str());
+}
+
 void display_button(const char* text,
                     uint16_t    x,
                     uint16_t    y,
@@ -301,23 +370,17 @@ void update_buttons(uint16_t touch_x, uint16_t touch_y)
 {
     bool button_on_pressed  = is_button_pressed(touch_x, touch_y, 20, 220, 180, 80);
     bool button_off_pressed = is_button_pressed(touch_x, touch_y, 280, 220, 180, 80);
-    bool result             = (button_on_pressed && !button_off_pressed)   ? true
-                              : (button_off_pressed && !button_on_pressed) ? false
-                                                                           : pump_state;
 
-    changePumpState(result);
-}
+    bool pump_state_local;
+    if (get_pump_state(pump_state_local))
+    {
+        bool result = (button_on_pressed && !button_off_pressed)   ? true
+                      : (button_off_pressed && !button_on_pressed) ? false
+                                                                   : pump_state_local;
 
-void configModeCallback(WiFiManager* myWiFiManager)
-{
-    Serial.println("Config mode!");
-    tft_text_setup(false, 2, TFT_YELLOW, TFT_BLACK);
-    tft.printf("Name:\n%s\n\nIP-address:\n%s\n",
-               myWiFiManager->getConfigPortalSSID().c_str(),
-               WiFi.softAPIP().toString().c_str());
-    Serial.printf("Name: %s\nIP-address: %s\n",
-                  myWiFiManager->getConfigPortalSSID().c_str(),
-                  WiFi.softAPIP().toString().c_str());
+        changePumpState(result);
+    }
+    else { log_w("get_pump_state failed!"); }
 }
 
 void init_motor()
@@ -335,15 +398,90 @@ void init_motor()
     stepper.setMaxSpeed(static_cast<float>(MOTOR_RPM * MOTOR_STEPS_PER_REV * MOTOR_MICROSTEPS));
 
     Serial.println("PUMP START");
-    changePumpState(pump_state);
+    changePumpState(PUMP_STATE_DEFAULT);
+}
+
+void motor_task(void* parameter)
+{
+    init_motor();
+
+    Serial.println("Entering Motor Task loop");
+    while (true)
+    {
+        bool pump_state_local;
+        if (get_pump_state(pump_state_local))
+        {
+            if (pump_state_local) { stepper.runSpeed(); }
+        }
+        else { log_w("get_pump_state failed!"); }
+
+        vTaskDelay(1 / portTICK_PERIOD_MS);
+    }
+}
+
+void webserver_task(void* parameter)
+{
+    server.on("/", handleRoot);
+    server.on("/turbidity/data", handleTurbidityData);  // Realtime data endpoint
+    server.on("/pump/on", handlePumpOn);
+    server.on("/pump/off", handlePumpOff);
+    server.on("/wifi/reset", handleWiFiReset);
+
+    server.begin();
+    tft_text_setup(false, 0, TFT_GREEN, TFT_BLACK);
+    tft.println("Webserver started.");
+    Serial.println("Webserver started.");
+
+    Serial.println("Entering Webserver Task loop");
+    while (true)
+    {
+        server.handleClient();  // Process incoming HTTP requests
+        delay(1);
+    }
+}
+
+void tft_touch_task(void* parameter)
+{
+    Serial.println("Entering TFT Touch Task loop");
+    while (true)
+    {
+        uint16_t        touch_x, touch_y;
+        static uint16_t prev_x, prev_y;
+
+        if (tft.getTouch(&touch_x, &touch_y))
+        {
+            prev_x = touch_x;
+            prev_y = touch_y;
+
+            update_buttons(prev_x, prev_y);
+            display_pump_state(7);
+        }
+
+        delay(50);
+    }
+}
+
+void get_data_task(void* parameter)
+{
+    Serial.println("Entering Get Data Task loop");
+    while (true)
+    {
+        get_turbidity_data(tft_prev_turbidity, false, true, 4);  // Print turbidity data
+        delay(1'000);
+    }
 }
 
 void setup()
 {
     Serial.begin(115200);
     Serial.println("Starting ESP!");
-    Serial.println("TFT Begin!");
+
+    semaphore_pump_state = xSemaphoreCreateMutex();
+    Serial.println("Created semaphore_pump_state!");
+
     tft.begin();
+    Serial.println("TFT Begin!");
+
     tft_text_setup(true);
     tft.println("TFT Setup Done!");
     Serial.println("TFT Setup Done!");
@@ -368,61 +506,15 @@ void setup()
         Serial.printf("%s\n%s", "WiFi connected!", WEBSERVER_IP_ADDRESS_TEXT.c_str());
     }
 
-    // Webserver routes
-    server.on("/", handleRoot);
-    server.on("/turbidity/data", handleTurbidityData);  // Realtime data endpoint
-    server.on("/pump/on", handlePumpOn);
-    server.on("/pump/off", handlePumpOff);
-    server.on("/wifi/reset", handleWiFiReset);
-
-    server.begin();
-    tft_text_setup(false, 0, TFT_GREEN, TFT_BLACK);
-    tft.println("Webserver started.");
-    Serial.println("Webserver started.");
-
     get_turbidity_data(tft_prev_turbidity, false, true, 4);  // Print turbidity data (only on TFT display)
-
     display_pump_state(7);
     display_button("ON", 20, 220, 180, 80, TFT_GREEN, TFT_BLACK);
     display_button("OFF", 280, 220, 180, 80, TFT_RED, TFT_BLACK);
 
-    init_motor();
+    xTaskCreatePinnedToCore(webserver_task, "webserver_task", 4096, NULL, 2, &webserver_task_handle, 0);
+    xTaskCreatePinnedToCore(tft_touch_task, "tft_touch_task", 2048, NULL, 3, &tft_touch_task_handle, 0);
+    xTaskCreatePinnedToCore(get_data_task, "get_data_task", 4096, NULL, 1, &get_data_task_handle, 0);
+    xTaskCreatePinnedToCore(motor_task, "motor_task", 4096, NULL, 10, &motor_task_handle, 1);  // Main App core
 }
 
-void loop()
-{
-    uint16_t        touch_x, touch_y;
-    static uint16_t prev_x, prev_y;
-    static uint64_t prev_time_turbidity = micros();
-    static uint64_t prev_time_server    = micros();
-    static uint64_t prev_time_touch     = micros();
-
-    // Motor control
-    if (pump_state) { stepper.runSpeed(); }
-
-    if (micros() - prev_time_touch >= 10'000)
-    {
-        prev_time_touch = micros();
-
-        if (tft.getTouch(&touch_x, &touch_y))
-        {
-            prev_x = touch_x;
-            prev_y = touch_y;
-
-            update_buttons(prev_x, prev_y);
-            display_pump_state(7);
-        }
-    }
-
-    if (micros() - prev_time_server >= 10'000)
-    {
-        prev_time_server = micros();
-        server.handleClient();  // Process incoming HTTP requests
-    }
-
-    if (micros() - prev_time_turbidity >= 1'000'000)
-    {
-        prev_time_turbidity = micros();
-        get_turbidity_data(tft_prev_turbidity, false, true, 4);  // Print turbidity data
-    }
-}
+void loop() {}
