@@ -7,18 +7,39 @@
 #include <TFT_eSPI.h>
 #include <AccelStepper.h>
 
-constexpr static const uint8_t  TFT_FONT_SIZE             = TFT_FONT_STYLE == 2 ? 16 : 8;
-constexpr static const uint8_t  TFT_FONT_SIZE_MULTIPLIER  = TFT_FONT_STYLE == 2 ? 2 : 3;
-constexpr static const uint8_t  MOTOR_MICROSTEPS          = 1;
-constexpr static const uint16_t MOTOR_RPM                 = 20;
-constexpr static const bool     PUMP_STATE_DEFAULT        = false;
-static String                   WEBSERVER_IP_ADDRESS_TEXT = "";
-static String                   WEBSERVER_TURBIDITY_DATA  = "";
-static String                   TFT_TURBIDITY_DATA        = "";
-static float                    tft_prev_turbidity        = -1.0F;
-static float                    ws_prev_turbidity         = -1.0F;
-static uint8_t                  led_state                 = LOW;
-static bool                     pump_state                = PUMP_STATE_DEFAULT;
+constexpr static const uint8_t TFT_FONT_SIZE            = TFT_FONT_STYLE == 2 ? 16 : 8;
+constexpr static const uint8_t TFT_FONT_SIZE_MULTIPLIER = TFT_FONT_STYLE == 2 ? 2 : 3;
+constexpr static const float   MOTOR_STEPS_PER_SECOND = (MOTOR_RPM * (MOTOR_STEPS_PER_REV * MOTOR_MICROSTEPS)) / 60.0F;
+static String                  WEBSERVER_IP_ADDRESS_TEXT = "";
+static uint8_t                 led_state                 = LOW;
+static bool                    pump_state                = PUMP_STATE_DEFAULT;
+
+struct DataStats
+{
+    float value;
+    float avg;
+};
+
+struct DataHistory
+{
+    float     history[TURBIDITY_HISTORY_SIZE] = {0.0F};
+    DataStats current                         = {0.0F};
+    DataStats previous                        = {-1.0F};
+    bool      is_rising                       = false;
+    bool      is_falling                      = false;
+};
+
+struct TurbidityData
+{
+    DataHistory ntu     = {};
+    DataHistory voltage = {};
+    uint16_t    index   = 0;
+    bool        is_text_data_json;
+    String      text_data = "";
+};
+
+static TurbidityData turbidity_data_tft = {.is_text_data_json = false, .text_data = ""};
+static TurbidityData turbidity_data_ws  = {.is_text_data_json = true, .text_data = ""};
 
 /**
  * @brief AccelStepper object, providing the motor control functionality
@@ -49,6 +70,13 @@ TaskHandle_t      motor_task_handle     = NULL;
 TaskHandle_t      tft_touch_task_handle = NULL;
 TaskHandle_t      webserver_task_handle = NULL;
 SemaphoreHandle_t semaphore_pump_state  = NULL;
+
+constexpr const float to_ntu_raw(float voltage)
+{
+    return voltage < 2.5 ? 3000.0F : (-1120.4F * sq(voltage) + 5742.3F * voltage - 4352.9F);
+}
+
+constexpr const float to_ntu(float voltage) { return to_ntu_raw(voltage) < 0 ? 0 : to_ntu_raw(voltage); }
 
 bool get_pump_state(bool& dest)
 {
@@ -148,20 +176,34 @@ void changePumpState(bool state)
         {
             if (set_pump_state(state))
             {
-                changeLedState(state ? HIGH : LOW);
+                // changeLedState(state ? HIGH : LOW);
                 display_pump_state(7);
 
                 if (state)
                 {
                     Serial.println("MOTOR START");
-                    stepper.setSpeed(MOTOR_RPM * MOTOR_STEPS_PER_REV * MOTOR_MICROSTEPS);
+
+                    // Change motor to normal mode
+                    digitalWrite(MOTOR_SLEEP_PIN, HIGH);
+                    digitalWrite(MOTOR_RESET_PIN, HIGH);
+                    digitalWrite(MOTOR_ENABLE_PIN, LOW);
+                    delay(1);
+
+                    stepper.setSpeed(MOTOR_STEPS_PER_SECOND);
                     stepper.runSpeed();
                 }
                 else
                 {
                     Serial.println("MOTOR STOP");
+
                     stepper.setSpeed(0);
                     stepper.stop();
+
+                    // Change motor to sleep mode
+                    digitalWrite(MOTOR_SLEEP_PIN, LOW);
+                    digitalWrite(MOTOR_RESET_PIN, LOW);
+                    digitalWrite(MOTOR_ENABLE_PIN, HIGH);
+                    delay(1);
                 }
             }
             else { log_w("set_pump_state failed!"); }
@@ -170,28 +212,66 @@ void changePumpState(bool state)
     else { log_w("get_pump_state failed!"); }
 }
 
-bool get_turbidity_data(float& prev_turbidity, bool serial_print = false, bool tft_print = true, uint8_t row = 4)
+bool get_turbidity_data(struct TurbidityData& turbidity_data,
+                        bool                  serial_print = false,
+                        bool                  tft_print    = true,
+                        uint8_t               row          = 4)
 {
+    uint16_t idx_local         = turbidity_data.index;
     uint16_t curr_sensor_value = analogRead(TURBIDITY_PIN);
-    float    voltage           = (TURBIDITY_SENSOR_INPUT_VOLTAGE * static_cast<float>(curr_sensor_value)) / 4095.0F;
-    float    turbidity_raw     = -1120.4F * sq(voltage) + 5742.3F * voltage - 4352.9F;
-    float    turbidity         = turbidity_raw < 0 ? 0 : turbidity_raw;
-    bool     new_data          = abs(turbidity - prev_turbidity) > 0.0F;
+    float    voltage_local     = (TURBIDITY_SENSOR_INPUT_VOLTAGE * static_cast<float>(curr_sensor_value)) / 4095.0F;
+    float    ntu_local         = to_ntu(voltage_local);
+
+    turbidity_data.ntu.current.value          = ntu_local;
+    turbidity_data.ntu.history[idx_local]     = ntu_local;
+    turbidity_data.voltage.current.value      = voltage_local;
+    turbidity_data.voltage.history[idx_local] = voltage_local;
+
+    float    _sum   = 0.0F;
+    uint16_t _count = 0;
+    for (uint16_t i = 0; i < TURBIDITY_HISTORY_SIZE; i++)
+    {
+        if (turbidity_data.voltage.history[i] > 0.0F)
+        {
+            _sum += turbidity_data.voltage.history[i];
+            _count++;
+        }
+    }
+
+    turbidity_data.voltage.current.avg = _count > 0 ? _sum / static_cast<float>(_count) : 0.0F;
+    turbidity_data.ntu.current.avg     = to_ntu(turbidity_data.voltage.current.avg);
+
+    bool new_data = abs(turbidity_data.voltage.current.avg - turbidity_data.voltage.previous.avg) > 0.0F;
+    turbidity_data.ntu.is_falling    = (turbidity_data.ntu.current.avg < turbidity_data.ntu.previous.avg);
+    turbidity_data.voltage.is_rising = (turbidity_data.voltage.current.avg > turbidity_data.voltage.previous.avg);
+    turbidity_data.index             = (idx_local + 1) % TURBIDITY_HISTORY_SIZE;
+
+    if (turbidity_data.ntu.current.avg < TURBIDITY_THRESHOLD && turbidity_data.voltage.is_rising)
+    {
+        changePumpState(false);
+    }
+
+    if (turbidity_data.is_text_data_json)
+    {
+        turbidity_data.text_data = "{\"turbidity\": " + String(turbidity_data.ntu.current.avg, 2)
+                                   + ", \"voltage\": " + String(turbidity_data.voltage.current.avg, 2) + "}";
+    }
+    else
+    {
+        turbidity_data.text_data = "Turbidity: " + String(turbidity_data.ntu.current.avg, 2) + " NTU" + "\n"
+                                   + "Voltage: " + String(turbidity_data.voltage.current.avg, 2) + " V";
+    }
 
     if (!new_data) { return false; }
-
-    WEBSERVER_TURBIDITY_DATA = "{\"turbidity\": " + String(turbidity, 2) + ", \"voltage\": " + String(voltage, 2) + "}";
-    TFT_TURBIDITY_DATA       = "Turbidity: " + String(turbidity, 2) + " NTU\nVoltage:   " + String(voltage, 2) + " V";
-
-    if (tft_print && new_data)
+    else if (tft_print && new_data)
     {
-        prev_turbidity = turbidity;
+        turbidity_data.voltage.previous = turbidity_data.voltage.current;
         tft_text_setup(false, row);
         tft_clear_row(row);
         tft_clear_row(row + 1);
-        tft.println(TFT_TURBIDITY_DATA.c_str());
+        tft.println(turbidity_data.text_data.c_str());
 
-        if (serial_print) { Serial.println(WEBSERVER_TURBIDITY_DATA.c_str()); }
+        if (serial_print) { Serial.println(turbidity_data.text_data.c_str()); }
     }
 
     return true;
@@ -314,9 +394,9 @@ void handlePumpOff()
 // Function: Realtime Turbidity Data (JSON)
 void handleTurbidityData()
 {
-    if (get_turbidity_data(ws_prev_turbidity, false, false, 4))
+    if (get_turbidity_data(turbidity_data_ws, false, false, 4))
     {
-        server.send(200, "application/json", WEBSERVER_TURBIDITY_DATA);
+        server.send(200, "application/json", turbidity_data_ws.text_data);
     }
 }
 
@@ -387,13 +467,20 @@ void init_motor()
 {
     Serial.println("PUMP INIT");
 
-    pinMode(MOTOR_MS1_PIN, OUTPUT);  // Microstep1 pin as output
-    pinMode(MOTOR_MS2_PIN, OUTPUT);  // Microstep2 pin as output
-    pinMode(MOTOR_MS3_PIN, OUTPUT);  // Microstep3 pin as output
+    pinMode(MOTOR_MS1_PIN, OUTPUT);     // Microstep1 pin as output
+    pinMode(MOTOR_MS2_PIN, OUTPUT);     // Microstep2 pin as output
+    pinMode(MOTOR_MS3_PIN, OUTPUT);     // Microstep3 pin as output
+    pinMode(MOTOR_SLEEP_PIN, OUTPUT);   // Sleep pin as output
+    pinMode(MOTOR_RESET_PIN, OUTPUT);   // Reset pin as output
+    pinMode(MOTOR_ENABLE_PIN, OUTPUT);  // Enable pin as output
 
     digitalWrite(MOTOR_MS1_PIN, LOW);  // Set microstep1 pin to low
     digitalWrite(MOTOR_MS2_PIN, LOW);  // Set microstep2 pin to low
     digitalWrite(MOTOR_MS3_PIN, LOW);  // Set microstep3 pin to low
+
+    digitalWrite(MOTOR_SLEEP_PIN, PUMP_STATE_DEFAULT ? HIGH : LOW);   // Set motor to normal or sleep mode
+    digitalWrite(MOTOR_RESET_PIN, PUMP_STATE_DEFAULT ? HIGH : LOW);   // Set motor to normal or sleep mode
+    digitalWrite(MOTOR_ENABLE_PIN, PUMP_STATE_DEFAULT ? LOW : HIGH);  // Set motor to normal or sleep mode
 
     stepper.setMaxSpeed(static_cast<float>(MOTOR_RPM * MOTOR_STEPS_PER_REV * MOTOR_MICROSTEPS));
 
@@ -457,7 +544,7 @@ void tft_touch_task(void* parameter)
             display_pump_state(7);
         }
 
-        delay(50);
+        delay(20);
     }
 }
 
@@ -466,8 +553,10 @@ void get_data_task(void* parameter)
     Serial.println("Entering Get Data Task loop");
     while (true)
     {
-        get_turbidity_data(tft_prev_turbidity, false, true, 4);  // Print turbidity data
-        delay(1'000);
+        // get_turbidity_data(turbidity_data_tft, true, true, 4);  // Print turbidity data
+        get_turbidity_data(turbidity_data_tft, false, true, 4);  // Print turbidity data
+        // get_turbidity_data(turbidity_data_tft, false, false, 4);  // Print turbidity data
+        delay(500);
     }
 }
 
@@ -506,14 +595,14 @@ void setup()
         Serial.printf("%s\n%s", "WiFi connected!", WEBSERVER_IP_ADDRESS_TEXT.c_str());
     }
 
-    get_turbidity_data(tft_prev_turbidity, false, true, 4);  // Print turbidity data (only on TFT display)
+    get_turbidity_data(turbidity_data_tft, false, true, 4);  // Print turbidity data (only on TFT display)
     display_pump_state(7);
     display_button("ON", 20, 220, 180, 80, TFT_GREEN, TFT_BLACK);
     display_button("OFF", 280, 220, 180, 80, TFT_RED, TFT_BLACK);
 
-    xTaskCreatePinnedToCore(webserver_task, "webserver_task", 4096, NULL, 2, &webserver_task_handle, 0);
-    xTaskCreatePinnedToCore(tft_touch_task, "tft_touch_task", 2048, NULL, 3, &tft_touch_task_handle, 0);
-    xTaskCreatePinnedToCore(get_data_task, "get_data_task", 4096, NULL, 1, &get_data_task_handle, 0);
+    xTaskCreatePinnedToCore(webserver_task, "webserver_task", 4096, NULL, 1, &webserver_task_handle, 0);
+    xTaskCreatePinnedToCore(tft_touch_task, "tft_touch_task", 4096, NULL, 3, &tft_touch_task_handle, 0);
+    xTaskCreatePinnedToCore(get_data_task, "get_data_task", 4096, NULL, 5, &get_data_task_handle, 0);
     xTaskCreatePinnedToCore(motor_task, "motor_task", 4096, NULL, 10, &motor_task_handle, 1);  // Main App core
 }
 
