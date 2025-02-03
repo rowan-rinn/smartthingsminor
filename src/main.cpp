@@ -1,3 +1,21 @@
+/** ----------------------------------------------------------------------------------------------------- 
+ * @file main.cpp
+ * @author Ben Groeneveld
+ * @author Eliam Traas
+ * @author Rowan de Heer
+ * @author Lorenzo van Yperen
+ * @author Jazz Aalbers
+ * @author Marco Stefancich
+ * 
+ * @brief 
+ * @version 0.1
+ * @date 2025-02-05
+ *  ----------------------------------------------------------------------------------------------------- **/
+
+/** ----------------------------------------------------------------------------------------------------- 
+ * $ INCLUDES
+ *  ----------------------------------------------------------------------------------------------------- **/
+
 #include <Arduino.h>
 #include <SPI.h>
 #include <LittleFS.h>
@@ -6,6 +24,10 @@
 #include <WiFiManager.h>
 #include <TFT_eSPI.h>
 #include <AccelStepper.h>
+
+/** ----------------------------------------------------------------------------------------------------- 
+ * $ GLOBAL VARIABLES
+ *  ----------------------------------------------------------------------------------------------------- **/
 
 constexpr static const uint8_t TFT_FONT_SIZE            = TFT_FONT_STYLE == 2 ? 16 : 8;
 constexpr static const uint8_t TFT_FONT_SIZE_MULTIPLIER = TFT_FONT_STYLE == 2 ? 2 : 3;
@@ -22,18 +44,18 @@ struct DataStats
 
 struct DataHistory
 {
-    float     history[TURBIDITY_HISTORY_SIZE] = {0.0F};
-    DataStats current                         = {0.0F};
-    DataStats previous                        = {-1.0F};
-    bool      is_rising                       = false;
-    bool      is_falling                      = false;
+    float     history[TURBIDITY_HISTORY_SIZE];
+    DataStats current    = {0.0F};
+    DataStats previous   = {-1.0F};
+    bool      is_rising  = false;
+    bool      is_falling = false;
 };
 
 struct TurbidityData
 {
-    DataHistory ntu     = {};
-    DataHistory voltage = {};
-    uint16_t    index   = 0;
+    DataHistory ntu;
+    DataHistory voltage;
+    uint16_t    index = 0;
     bool        is_text_data_json;
     String      text_data = "";
 };
@@ -71,10 +93,21 @@ TaskHandle_t      tft_touch_task_handle = NULL;
 TaskHandle_t      webserver_task_handle = NULL;
 SemaphoreHandle_t semaphore_pump_state  = NULL;
 
-constexpr const float to_ntu_raw(float voltage)
+/** ----------------------------------------------------------------------------------------------------- 
+ * $ FUNCTION DECLARATIONS
+ *  ----------------------------------------------------------------------------------------------------- **/
+
+constexpr const float to_voltage_raw(uint16_t analog_value)
 {
-    return voltage < 2.5 ? 3000.0F : (-1120.4F * sq(voltage) + 5742.3F * voltage - 4352.9F);
+    return static_cast<float>(analog_value) * (TURBIDITY_SENSOR_INPUT_VOLTAGE / 4096.0F);
 }
+
+constexpr const float to_voltage(uint16_t analog_value)
+{
+    return to_voltage_raw(analog_value) < 0 ? 0 : to_voltage_raw(analog_value);
+}
+
+constexpr const float to_ntu_raw(float voltage) { return (-1120.4F * sq(voltage) + 5742.3F * voltage - 4352.9F); }
 
 constexpr const float to_ntu(float voltage) { return to_ntu_raw(voltage) < 0 ? 0 : to_ntu_raw(voltage); }
 
@@ -219,8 +252,15 @@ bool get_turbidity_data(struct TurbidityData& turbidity_data,
 {
     uint16_t idx_local         = turbidity_data.index;
     uint16_t curr_sensor_value = analogRead(TURBIDITY_PIN);
-    float    voltage_local     = (TURBIDITY_SENSOR_INPUT_VOLTAGE * static_cast<float>(curr_sensor_value)) / 4095.0F;
+    float    voltage_local     = to_voltage(curr_sensor_value);
     float    ntu_local         = to_ntu(voltage_local);
+
+#if SERIAL_DEBUG
+    Serial.printf("CURRENT => [ NTU: %f NTU, Voltage: %f V, AnalogRead: %u ]\n",
+                  ntu_local,
+                  voltage_local,
+                  curr_sensor_value);
+#endif
 
     turbidity_data.ntu.current.value          = ntu_local;
     turbidity_data.ntu.history[idx_local]     = ntu_local;
@@ -242,14 +282,67 @@ bool get_turbidity_data(struct TurbidityData& turbidity_data,
     turbidity_data.ntu.current.avg     = to_ntu(turbidity_data.voltage.current.avg);
 
     bool new_data = abs(turbidity_data.voltage.current.avg - turbidity_data.voltage.previous.avg) > 0.0F;
-    turbidity_data.ntu.is_falling    = (turbidity_data.ntu.current.avg < turbidity_data.ntu.previous.avg);
-    turbidity_data.voltage.is_rising = (turbidity_data.voltage.current.avg > turbidity_data.voltage.previous.avg);
-    turbidity_data.index             = (idx_local + 1) % TURBIDITY_HISTORY_SIZE;
 
-    if (turbidity_data.ntu.current.avg < TURBIDITY_THRESHOLD && turbidity_data.voltage.is_rising)
+    float    lin_regr_sum_x        = 0.0F;
+    float    lin_regr_sum_y        = 0.0F;
+    float    lin_regr_sum_xy       = 0.0F;
+    float    lin_regr_sum_x_square = 0.0F;
+    float    lin_regr_coeff        = 0.0F;
+    uint16_t lin_regr_count        = 0;
+
+    for (uint16_t i = 0; i < TURBIDITY_HISTORY_SIZE; i++)
     {
-        changePumpState(false);
+        if (turbidity_data.voltage.history[i] > 0.0F)
+        {
+            lin_regr_sum_y += turbidity_data.voltage.history[i];
+            lin_regr_sum_x += i;
+            lin_regr_sum_xy += i * turbidity_data.voltage.history[i];
+            lin_regr_sum_x_square += sq(i);
+            lin_regr_count += 1;
+        }
     }
+
+    if (lin_regr_count > 1)
+    {
+        float n                    = static_cast<float>(lin_regr_count);
+        float lin_regr_numerator   = (n * lin_regr_sum_xy) - (lin_regr_sum_x * lin_regr_sum_y);
+        float lin_regr_denominator = (n * lin_regr_sum_x_square) - (lin_regr_sum_x * lin_regr_sum_x);
+        lin_regr_coeff             = lin_regr_denominator != 0.0F ? lin_regr_numerator / lin_regr_denominator : 0.0F;
+
+        turbidity_data.voltage.is_rising = lin_regr_coeff > 0.0F;
+    }
+
+#if SERIAL_DEBUG
+    Serial.printf("CURRENT => [ NTU: %f NTU, Voltage: %f V, AnalogRead: %u, Coeff: %f, IsRising: %s ]\n",
+                  ntu_local,
+                  voltage_local,
+                  curr_sensor_value,
+                  lin_regr_coeff,
+                  turbidity_data.voltage.is_rising ? "YES" : "NO");
+    #if false
+    Serial.printf("HISTORY =>\n{\n");
+    for (uint16_t i = 0; i < TURBIDITY_HISTORY_SIZE; i++)
+    {
+        Serial.printf("  [%u] => [ NTU: %f NTU, Voltage: %f V ]\n",
+                      i,
+                      turbidity_data.ntu.history[i],
+                      turbidity_data.voltage.history[i]);
+    }
+    Serial.printf("}\n");
+    #endif
+#endif
+
+    // turbidity_data.ntu.is_falling = (turbidity_data.ntu.current.avg < turbidity_data.ntu.previous.avg)
+    //                                 && turbidity_data.voltage.previous.avg >= 0.0F;
+    // turbidity_data.voltage.is_rising = (turbidity_data.voltage.current.avg > turbidity_data.voltage.previous.avg)
+    //                                    && turbidity_data.voltage.previous.avg >= 0.0F;
+    turbidity_data.index = (idx_local + 1) % TURBIDITY_HISTORY_SIZE;
+
+    // bool is_clean = (turbidity_data.ntu.current.avg < TURBIDITY_THRESHOLD && turbidity_data.voltage.is_rising);
+    bool is_clean =
+        (turbidity_data.voltage.current.avg > TURBIDITY_VOLTAGE_THRESHOLD && turbidity_data.voltage.is_rising);
+
+    if (is_clean) { changePumpState(false); }
 
     if (turbidity_data.is_text_data_json)
     {
@@ -258,8 +351,10 @@ bool get_turbidity_data(struct TurbidityData& turbidity_data,
     }
     else
     {
-        turbidity_data.text_data = "Turbidity: " + String(turbidity_data.ntu.current.avg, 2) + " NTU" + "\n"
-                                   + "Voltage: " + String(turbidity_data.voltage.current.avg, 2) + " V";
+        String is_clean_str      = is_clean ? "YES" : "NO";
+        turbidity_data.text_data = "AVG. Turb: " + String(turbidity_data.ntu.current.avg, 2) + " NTU" + "\n"
+                                   + "AVG. Volt: " + String(turbidity_data.voltage.current.avg, 2) + " V" + "\n"
+                                   + "Is Clean?: " + is_clean_str;
     }
 
     if (!new_data) { return false; }
@@ -267,8 +362,7 @@ bool get_turbidity_data(struct TurbidityData& turbidity_data,
     {
         turbidity_data.voltage.previous = turbidity_data.voltage.current;
         tft_text_setup(false, row);
-        tft_clear_row(row);
-        tft_clear_row(row + 1);
+        for (uint8_t i = 0; i < 3; i++) { tft_clear_row(row + i); }
         tft.println(turbidity_data.text_data.c_str());
 
         if (serial_print) { Serial.println(turbidity_data.text_data.c_str()); }
@@ -482,6 +576,7 @@ void init_motor()
     digitalWrite(MOTOR_RESET_PIN, PUMP_STATE_DEFAULT ? HIGH : LOW);   // Set motor to normal or sleep mode
     digitalWrite(MOTOR_ENABLE_PIN, PUMP_STATE_DEFAULT ? LOW : HIGH);  // Set motor to normal or sleep mode
 
+    stepper.setPinsInverted(PUMP_DIRECTION_INVERTED, false, false);
     stepper.setMaxSpeed(static_cast<float>(MOTOR_RPM * MOTOR_STEPS_PER_REV * MOTOR_MICROSTEPS));
 
     Serial.println("PUMP START");
@@ -550,15 +645,27 @@ void tft_touch_task(void* parameter)
 
 void get_data_task(void* parameter)
 {
+    for (uint16_t i = 0; i < TURBIDITY_HISTORY_SIZE; i++)
+    {
+        turbidity_data_tft.ntu.history[i]     = 0.0F;
+        turbidity_data_tft.voltage.history[i] = 0.0F;
+        turbidity_data_ws.ntu.history[i]      = 0.0F;
+        turbidity_data_ws.voltage.history[i]  = 0.0F;
+    }
+
     Serial.println("Entering Get Data Task loop");
     while (true)
     {
         // get_turbidity_data(turbidity_data_tft, true, true, 4);  // Print turbidity data
         get_turbidity_data(turbidity_data_tft, false, true, 4);  // Print turbidity data
         // get_turbidity_data(turbidity_data_tft, false, false, 4);  // Print turbidity data
-        delay(500);
+        delay(2'000);
     }
 }
+
+/** ----------------------------------------------------------------------------------------------------- 
+ * $$ ARDUINO SETUP
+ *  ----------------------------------------------------------------------------------------------------- **/
 
 void setup()
 {
@@ -605,5 +712,9 @@ void setup()
     xTaskCreatePinnedToCore(get_data_task, "get_data_task", 4096, NULL, 5, &get_data_task_handle, 0);
     xTaskCreatePinnedToCore(motor_task, "motor_task", 4096, NULL, 10, &motor_task_handle, 1);  // Main App core
 }
+
+/** ----------------------------------------------------------------------------------------------------- 
+ * $$ ARDUINO LOOP
+ *  ----------------------------------------------------------------------------------------------------- **/
 
 void loop() {}
