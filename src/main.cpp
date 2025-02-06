@@ -9,7 +9,7 @@
  * 
  * @brief 
  * @version 0.1
- * @date 2025-02-05
+ * @date 2024-2025
  *  ----------------------------------------------------------------------------------------------------- **/
 
 /** ----------------------------------------------------------------------------------------------------- 
@@ -29,12 +29,30 @@
  * $ GLOBAL VARIABLES
  *  ----------------------------------------------------------------------------------------------------- **/
 
+#ifdef TURBIDITY_SENSOR_3V3
+constexpr static const float TURBIDITY_SENSOR_INPUT_VOLTAGE = 3.3F;
+#else
+constexpr static const float TURBIDITY_SENSOR_INPUT_VOLTAGE = 5.0F;
+#endif
+
+#if !SCREEN_PORTRAIT && SCREEN_INVERTED
+constexpr static const uint8_t SCREEN_ROTATION = 1;
+#elif !SCREEN_PORTRAIT && !SCREEN_INVERTED
+constexpr static const uint8_t SCREEN_ROTATION = 3;
+#elif SCREEN_PORTRAIT && SCREEN_INVERTED
+constexpr static const uint8_t SCREEN_ROTATION = 0;
+#elif SCREEN_PORTRAIT && !SCREEN_INVERTED
+constexpr static const uint8_t SCREEN_ROTATION = 2;
+#endif
+
 constexpr static const uint8_t TFT_FONT_SIZE            = TFT_FONT_STYLE == 2 ? 16 : 8;
 constexpr static const uint8_t TFT_FONT_SIZE_MULTIPLIER = TFT_FONT_STYLE == 2 ? 2 : 3;
 constexpr static const float   MOTOR_STEPS_PER_SECOND = (MOTOR_RPM * (MOTOR_STEPS_PER_REV * MOTOR_MICROSTEPS)) / 60.0F;
 static String                  WEBSERVER_IP_ADDRESS_TEXT = "";
 static uint8_t                 led_state                 = LOW;
 static bool                    pump_state                = PUMP_STATE_DEFAULT;
+static bool                    is_clean                  = false;
+static bool                    manual_keep_pump_on       = false;
 
 struct DataStats
 {
@@ -44,11 +62,11 @@ struct DataStats
 
 struct DataHistory
 {
-    float     history[TURBIDITY_HISTORY_SIZE];
-    DataStats current    = {0.0F};
-    DataStats previous   = {-1.0F};
-    bool      is_rising  = false;
-    bool      is_falling = false;
+    float     history[TURBIDITY_HISTORY_SIZE] = {0.0F};
+    DataStats current                         = {0.0F};
+    DataStats previous                        = {-1.0F};
+    bool      is_rising                       = false;
+    bool      is_falling                      = false;
 };
 
 struct TurbidityData
@@ -56,12 +74,12 @@ struct TurbidityData
     DataHistory ntu;
     DataHistory voltage;
     uint16_t    index = 0;
-    bool        is_text_data_json;
-    String      text_data = "";
+    // bool        is_text_data_json;
+    String text_data      = "";
+    String text_data_json = "";
 };
 
-static TurbidityData turbidity_data_tft = {.is_text_data_json = false, .text_data = ""};
-static TurbidityData turbidity_data_ws  = {.is_text_data_json = true, .text_data = ""};
+static TurbidityData turbidity_data_s = {.text_data = "", .text_data_json = ""};
 
 /**
  * @brief AccelStepper object, providing the motor control functionality
@@ -87,11 +105,14 @@ WiFiManager wifiManager;
  */
 WebServer server(WEBSERVER_PORT);
 
-TaskHandle_t      get_data_task_handle  = NULL;
-TaskHandle_t      motor_task_handle     = NULL;
-TaskHandle_t      tft_touch_task_handle = NULL;
-TaskHandle_t      webserver_task_handle = NULL;
-SemaphoreHandle_t semaphore_pump_state  = NULL;
+TaskHandle_t      get_data_task_handle          = NULL;
+TaskHandle_t      motor_task_handle             = NULL;
+TaskHandle_t      tft_touch_task_handle         = NULL;
+TaskHandle_t      webserver_task_handle         = NULL;
+SemaphoreHandle_t semaphore_pump_state          = NULL;
+SemaphoreHandle_t semaphore_manual_keep_pump_on = NULL;
+SemaphoreHandle_t semaphore_is_clean            = NULL;
+SemaphoreHandle_t semaphore_turbidity_data      = NULL;
 
 /** ----------------------------------------------------------------------------------------------------- 
  * $ FUNCTION DECLARATIONS
@@ -107,44 +128,97 @@ constexpr const float to_voltage(uint16_t analog_value)
     return to_voltage_raw(analog_value) < 0 ? 0 : to_voltage_raw(analog_value);
 }
 
-constexpr const float to_ntu_raw(float voltage) { return (-1120.4F * sq(voltage) + 5742.3F * voltage - 4352.9F); }
+constexpr const float to_ntu_raw(float voltage)
+{
+#if TURBIDITY_SENSOR_3V3
+    return (-2572.2F * sq(voltage) + 8700.5F * voltage - 4352.9F);
+#else
+    return (-1120.4F * sq(voltage) + 5742.3F * voltage - 4352.9F);
+#endif
+}
 
 constexpr const float to_ntu(float voltage) { return to_ntu_raw(voltage) < 0 ? 0 : to_ntu_raw(voltage); }
 
-bool get_pump_state(bool& dest)
+template<typename T>
+bool semaphore_get(T& dest, T& src, SemaphoreHandle_t& semaphore_handle, const char* semaphore_name = "semaphore")
 {
-    if (semaphore_pump_state != NULL)
+    if (semaphore_handle != NULL)
     {
-        if (xSemaphoreTake(semaphore_pump_state, 2) == pdTRUE)
+        if (xSemaphoreTake(semaphore_handle, 2) == pdTRUE)
         {
-            dest = pump_state;
-            xSemaphoreGive(semaphore_pump_state);
+            dest = src;
+            xSemaphoreGive(semaphore_handle);
 
             return true;
         }
-        else { log_w("Could not take semaphore_pump_state"); }
+        else { log_w("Could not take %s", semaphore_name); }
     }
-    else { log_w("semaphore_pump_state is NULL"); }
+    else { log_w("%s is NULL", semaphore_name); }
 
     return false;
 }
 
-bool set_pump_state(bool state)
+template<typename T>
+bool semaphore_set(T&                 dest,
+                   T                  value,
+                   SemaphoreHandle_t& semaphore_handle,
+                   const char*        semaphore_name = "semaphore",
+                   uint32_t           timeout        = 100)
 {
-    if (semaphore_pump_state != NULL)
+    if (semaphore_handle != NULL)
     {
-        if (xSemaphoreTake(semaphore_pump_state, static_cast<TickType_t>(100 / portTICK_PERIOD_MS)) == pdTRUE)
+        if (xSemaphoreTake(semaphore_handle, static_cast<TickType_t>(timeout / portTICK_PERIOD_MS)) == pdTRUE)
         {
-            pump_state = state;
-            xSemaphoreGive(semaphore_pump_state);
+            dest = value;
+            xSemaphoreGive(semaphore_handle);
 
             return true;
         }
-        else { log_w("Could not take semaphore_pump_state"); }
+        else { log_w("Could not take %s", semaphore_name); }
     }
-    else { log_w("semaphore_pump_state is NULL"); }
+    else { log_w("%s is NULL", semaphore_name); }
 
     return false;
+}
+
+bool get_semaphore_turbidity_data(TurbidityData& dest)
+{
+    return semaphore_get(dest, turbidity_data_s, semaphore_turbidity_data, "semaphore_turbidity_data");
+}
+bool set_semaphore_turbidity_data(TurbidityData state)
+{
+    return semaphore_set(turbidity_data_s, state, semaphore_turbidity_data, "semaphore_turbidity_data", 100);
+}
+
+bool get_semaphore_is_clean_state(bool& dest)
+{
+    return semaphore_get(dest, is_clean, semaphore_is_clean, "semaphore_is_clean");
+}
+bool set_semaphore_is_clean_state(bool state)
+{
+    return semaphore_set(is_clean, state, semaphore_is_clean, "semaphore_is_clean", 50);
+}
+
+bool get_semaphore_manual_keep_pump_on_state(bool& dest)
+{
+    return semaphore_get(dest, manual_keep_pump_on, semaphore_manual_keep_pump_on, "semaphore_manual_keep_pump_on");
+}
+bool set_semaphore_manual_keep_pump_on_state(bool state)
+{
+    return semaphore_set(manual_keep_pump_on,
+                         state,
+                         semaphore_manual_keep_pump_on,
+                         "semaphore_manual_keep_pump_on",
+                         50);
+}
+
+bool get_semaphore_pump_state(bool& dest)
+{
+    return semaphore_get(dest, pump_state, semaphore_pump_state, "semaphore_pump_state");
+}
+bool set_semaphore_pump_state(bool state)
+{
+    return semaphore_set(pump_state, state, semaphore_pump_state, "semaphore_pump_state", 50);
 }
 
 constexpr const uint16_t to_tft_y(uint8_t row, uint8_t fonst_size_multiplier = TFT_FONT_SIZE_MULTIPLIER)
@@ -167,7 +241,7 @@ void tft_text_setup(bool     clear_screen = false,
                     uint8_t  font_size    = TFT_FONT_SIZE_MULTIPLIER)
 {
     if (clear_screen) { tft.fillScreen(TFT_BLACK); }
-    tft.setRotation(3);
+    tft.setRotation(SCREEN_ROTATION);
     tft.setCursor(0, to_tft_y(row));
     tft.setTextFont(font_style);
     tft.setTextColor(fg_color, bg_color);
@@ -181,12 +255,12 @@ void display_pump_state(uint8_t row = 7)
     tft_clear_row(row + 1);
 
     bool pump_state_local;
-    if (get_pump_state(pump_state_local))
+    if (get_semaphore_pump_state(pump_state_local))
     {
         tft_text_setup(false, row + 1, pump_state_local ? TFT_GREEN : TFT_RED);
         tft.printf("%s", pump_state_local ? "ON" : "OFF");
     }
-    else { log_w("get_pump_state failed!"); }
+    else { log_w("get_semaphore_pump_state failed!"); }
 }
 
 // Function: Change LED State
@@ -203,11 +277,11 @@ void changeLedState(uint8_t state)
 void changePumpState(bool state)
 {
     bool pump_state_local;
-    if (get_pump_state(pump_state_local))
+    if (get_semaphore_pump_state(pump_state_local))
     {
         if (pump_state_local != state)
         {
-            if (set_pump_state(state))
+            if (set_semaphore_pump_state(state))
             {
                 // changeLedState(state ? HIGH : LOW);
                 display_pump_state(7);
@@ -215,6 +289,22 @@ void changePumpState(bool state)
                 if (state)
                 {
                     Serial.println("MOTOR START");
+
+#if USE_TURBIDITY_SENSOR
+                    bool local_manual_keep_pump_on, local_is_clean;
+                    if (get_semaphore_manual_keep_pump_on_state(local_manual_keep_pump_on)
+                        && get_semaphore_is_clean_state(local_is_clean))
+                    {
+                        if (!local_manual_keep_pump_on && local_is_clean)
+                        {
+                            if (!set_semaphore_manual_keep_pump_on_state(true))
+                            {
+                                log_w("set_semaphore_manual_keep_pump_on_state failed!");
+                            }
+                        }
+                    }
+                    else { log_w("get_semaphore_manual_keep_pump_on_state or get_semaphore_is_clean_state failed!"); }
+#endif
 
                     // Change motor to normal mode
                     digitalWrite(MOTOR_SLEEP_PIN, HIGH);
@@ -229,6 +319,19 @@ void changePumpState(bool state)
                 {
                     Serial.println("MOTOR STOP");
 
+#if USE_TURBIDITY_SENSOR
+                    bool local_manual_keep_pump_on, local_is_clean;
+                    if (get_semaphore_manual_keep_pump_on_state(local_manual_keep_pump_on)
+                        && get_semaphore_is_clean_state(local_is_clean))
+                    {
+                        if (local_manual_keep_pump_on || !local_is_clean)
+                        {
+                            set_semaphore_manual_keep_pump_on_state(false);
+                        }
+                    }
+                    else { log_w("get_semaphore_manual_keep_pump_on_state or get_semaphore_is_clean_state failed!"); }
+#endif
+
                     stepper.setSpeed(0);
                     stepper.stop();
 
@@ -239,49 +342,44 @@ void changePumpState(bool state)
                     delay(1);
                 }
             }
-            else { log_w("set_pump_state failed!"); }
+            else { log_w("set_semaphore_pump_state failed!"); }
         }
     }
-    else { log_w("get_pump_state failed!"); }
+    else { log_w("get_semaphore_pump_state failed!"); }
 }
 
-bool get_turbidity_data(struct TurbidityData& turbidity_data,
-                        bool                  serial_print = false,
-                        bool                  tft_print    = true,
-                        uint8_t               row          = 4)
+bool get_turbidity_data(bool serial_print = false, bool tft_print = true, uint8_t row = 4)
 {
-    uint16_t idx_local         = turbidity_data.index;
+    TurbidityData local_turbidity_data;
+    if (!get_semaphore_turbidity_data(local_turbidity_data)) { return false; }
+
+    uint16_t idx_local         = local_turbidity_data.index;
     uint16_t curr_sensor_value = analogRead(TURBIDITY_PIN);
     float    voltage_local     = to_voltage(curr_sensor_value);
     float    ntu_local         = to_ntu(voltage_local);
 
-#if SERIAL_DEBUG
-    Serial.printf("CURRENT => [ NTU: %f NTU, Voltage: %f V, AnalogRead: %u ]\n",
-                  ntu_local,
-                  voltage_local,
-                  curr_sensor_value);
-#endif
-
-    turbidity_data.ntu.current.value          = ntu_local;
-    turbidity_data.ntu.history[idx_local]     = ntu_local;
-    turbidity_data.voltage.current.value      = voltage_local;
-    turbidity_data.voltage.history[idx_local] = voltage_local;
+    local_turbidity_data.ntu.current.value          = ntu_local;
+    local_turbidity_data.ntu.history[idx_local]     = ntu_local;
+    local_turbidity_data.voltage.current.value      = voltage_local;
+    local_turbidity_data.voltage.history[idx_local] = voltage_local;
 
     float    _sum   = 0.0F;
     uint16_t _count = 0;
     for (uint16_t i = 0; i < TURBIDITY_HISTORY_SIZE; i++)
     {
-        if (turbidity_data.voltage.history[i] > 0.0F)
+        float _voltage         = local_turbidity_data.voltage.history[i];
+        float _voltage_rounded = roundf(_voltage * 1000.0F) / 1000.0F;
+        if (_voltage_rounded > 0.0F && _voltage_rounded <= TURBIDITY_SENSOR_INPUT_VOLTAGE)
         {
-            _sum += turbidity_data.voltage.history[i];
+            _sum += _voltage;
             _count++;
         }
     }
 
-    turbidity_data.voltage.current.avg = _count > 0 ? _sum / static_cast<float>(_count) : 0.0F;
-    turbidity_data.ntu.current.avg     = to_ntu(turbidity_data.voltage.current.avg);
+    local_turbidity_data.voltage.current.avg = _count > 0 ? _sum / static_cast<float>(_count) : 0.0F;
+    local_turbidity_data.ntu.current.avg     = to_ntu(local_turbidity_data.voltage.current.avg);
 
-    bool new_data = abs(turbidity_data.voltage.current.avg - turbidity_data.voltage.previous.avg) > 0.0F;
+    bool new_data = abs(local_turbidity_data.voltage.current.avg - local_turbidity_data.voltage.previous.avg) > 0.0F;
 
     float    lin_regr_sum_x        = 0.0F;
     float    lin_regr_sum_y        = 0.0F;
@@ -292,11 +390,11 @@ bool get_turbidity_data(struct TurbidityData& turbidity_data,
 
     for (uint16_t i = 0; i < TURBIDITY_HISTORY_SIZE; i++)
     {
-        if (turbidity_data.voltage.history[i] > 0.0F)
+        if (local_turbidity_data.voltage.history[i] > 0.0F)
         {
-            lin_regr_sum_y += turbidity_data.voltage.history[i];
+            lin_regr_sum_y += local_turbidity_data.voltage.history[i];
             lin_regr_sum_x += i;
-            lin_regr_sum_xy += i * turbidity_data.voltage.history[i];
+            lin_regr_sum_xy += i * local_turbidity_data.voltage.history[i];
             lin_regr_sum_x_square += sq(i);
             lin_regr_count += 1;
         }
@@ -309,8 +407,39 @@ bool get_turbidity_data(struct TurbidityData& turbidity_data,
         float lin_regr_denominator = (n * lin_regr_sum_x_square) - (lin_regr_sum_x * lin_regr_sum_x);
         lin_regr_coeff             = lin_regr_denominator != 0.0F ? lin_regr_numerator / lin_regr_denominator : 0.0F;
 
-        turbidity_data.voltage.is_rising = lin_regr_coeff > 0.0F;
+        local_turbidity_data.voltage.is_rising  = lin_regr_coeff > 0.0F;
+        local_turbidity_data.voltage.is_falling = lin_regr_coeff < 0.0F;
     }
+
+    bool is_clean_flag         = !local_turbidity_data.voltage.is_falling;
+    local_turbidity_data.index = (idx_local + 1) % TURBIDITY_HISTORY_SIZE;
+    bool local_clean_state = (local_turbidity_data.voltage.current.avg > TURBIDITY_VOLTAGE_THRESHOLD) && is_clean_flag;
+
+    if (!set_semaphore_is_clean_state(local_clean_state)) { log_w("set_semaphore_is_clean_state failed!"); }
+
+#if USE_TURBIDITY_SENSOR
+    if (!local_clean_state)
+    {
+        if (!set_semaphore_manual_keep_pump_on_state(false)) { log_w("set_semaphore_is_clean_state failed!"); }
+    }
+#endif
+
+#if USE_TURBIDITY_SENSOR
+    bool local_manual_keep_pump_on;
+    if (get_semaphore_manual_keep_pump_on_state(local_manual_keep_pump_on))
+    {
+        if (local_clean_state && !local_manual_keep_pump_on) { changePumpState(false); }
+    }
+#endif
+
+    String is_clean_str                 = local_clean_state ? "YES" : "NO";
+    local_turbidity_data.text_data_json = "{\"turbidity\": " + String(local_turbidity_data.ntu.current.value, 2)
+                                          + ", \"voltage\": " + String(local_turbidity_data.voltage.current.value, 2)
+                                          + ", \"avg_voltage\": " + String(local_turbidity_data.voltage.current.avg, 2)
+                                          + "}";
+    local_turbidity_data.text_data = "AVG Volt.: " + String(local_turbidity_data.voltage.current.avg, 2) + " V" + "\n"
+                                     + "Voltage: " + String(local_turbidity_data.voltage.current.value, 2) + " V" + "\n"
+                                     + "Is Clean?: " + is_clean_str;
 
 #if SERIAL_DEBUG
     Serial.printf("CURRENT => [ NTU: %f NTU, Voltage: %f V, AnalogRead: %u, Coeff: %f, IsRising: %s ]\n",
@@ -318,117 +447,102 @@ bool get_turbidity_data(struct TurbidityData& turbidity_data,
                   voltage_local,
                   curr_sensor_value,
                   lin_regr_coeff,
-                  turbidity_data.voltage.is_rising ? "YES" : "NO");
-    #if false
+                  local_turbidity_data.voltage.is_rising ? "YES" : "NO");
+
+    Serial.printf("AVERAGE => [ NTU: %f NTU, Voltage: %f V, IsRising: %s, Is Clean: %s ]\n",
+                  local_turbidity_data.ntu.current.avg,
+                  local_turbidity_data.voltage.current.avg,
+                  local_turbidity_data.voltage.is_rising ? "YES" : "NO",
+                  local_clean_state ? "YES" : "NO");
+
+    #if SERIAL_DEBUG_HISTORY
     Serial.printf("HISTORY =>\n{\n");
     for (uint16_t i = 0; i < TURBIDITY_HISTORY_SIZE; i++)
     {
         Serial.printf("  [%u] => [ NTU: %f NTU, Voltage: %f V ]\n",
                       i,
-                      turbidity_data.ntu.history[i],
-                      turbidity_data.voltage.history[i]);
+                      local_turbidity_data.ntu.history[i],
+                      local_turbidity_data.voltage.history[i]);
     }
     Serial.printf("}\n");
     #endif
 #endif
 
-    // turbidity_data.ntu.is_falling = (turbidity_data.ntu.current.avg < turbidity_data.ntu.previous.avg)
-    //                                 && turbidity_data.voltage.previous.avg >= 0.0F;
-    // turbidity_data.voltage.is_rising = (turbidity_data.voltage.current.avg > turbidity_data.voltage.previous.avg)
-    //                                    && turbidity_data.voltage.previous.avg >= 0.0F;
-    turbidity_data.index = (idx_local + 1) % TURBIDITY_HISTORY_SIZE;
-
-    // bool is_clean = (turbidity_data.ntu.current.avg < TURBIDITY_THRESHOLD && turbidity_data.voltage.is_rising);
-    bool is_clean =
-        (turbidity_data.voltage.current.avg > TURBIDITY_VOLTAGE_THRESHOLD && turbidity_data.voltage.is_rising);
-
-    if (is_clean) { changePumpState(false); }
-
-    if (turbidity_data.is_text_data_json)
-    {
-        turbidity_data.text_data = "{\"turbidity\": " + String(turbidity_data.ntu.current.avg, 2)
-                                   + ", \"voltage\": " + String(turbidity_data.voltage.current.avg, 2) + "}";
-    }
-    else
-    {
-        String is_clean_str      = is_clean ? "YES" : "NO";
-        turbidity_data.text_data = "AVG. Turb: " + String(turbidity_data.ntu.current.avg, 2) + " NTU" + "\n"
-                                   + "AVG. Volt: " + String(turbidity_data.voltage.current.avg, 2) + " V" + "\n"
-                                   + "Is Clean?: " + is_clean_str;
-    }
-
     if (!new_data) { return false; }
     else if (tft_print && new_data)
     {
-        turbidity_data.voltage.previous = turbidity_data.voltage.current;
+        local_turbidity_data.voltage.previous = local_turbidity_data.voltage.current;
         tft_text_setup(false, row);
         for (uint8_t i = 0; i < 3; i++) { tft_clear_row(row + i); }
-        tft.println(turbidity_data.text_data.c_str());
+        tft.println(local_turbidity_data.text_data.c_str());
 
-        if (serial_print) { Serial.println(turbidity_data.text_data.c_str()); }
+        if (serial_print) { Serial.println(local_turbidity_data.text_data.c_str()); }
     }
 
-    return true;
+    bool result = set_semaphore_turbidity_data(local_turbidity_data);
+
+    return result;
 }
 
 // Function: HTML-header with CSS and JavaScript for real-time updates
 String getHtmlHeader()
 {
-    return "<!DOCTYPE html>\n"
-           "<html>\n"
-           "<head>\n"
-           "<title>ESP32 Webinterface</title>\n"
-           "<style>\n"
-           "  body { font-family: Arial, sans-serif; text-align: center; margin: 0; padding: 0; background-color: #f4f4f9; }\n"
-           "  h1 { color: #333; }\n"
-           "  p { color: #666; font-size: 18px; }\n"
-           "  .container { max-width: 600px; margin: auto; padding: 20px; }\n"
-           "  button { padding: 10px 20px; font-size: 16px; color: #fff; background-color: #007BFF; border: none; border-radius: 5px; cursor: pointer; }\n"
-           "  button:hover { background-color: #0056b3; }\n"
-           "  .link { text-decoration: none; }\n"
-           "  .card { margin: 20px auto; padding: 15px; border-radius: 8px; background: #fff; box-shadow: 0 4px 8px rgba(0,0,0,0.2); }\n"
-           "  .banner { width: 100%; display: flex; justify-content: center; align-items: center; background-color: #fff; padding: 10px 0; }\n"
-           "  .svg-container { max-width: 600px; width: 100%; }\n"
-           "  .data-section { margin-top: 20px; padding: 15px; background-color: #ffffff; border-radius: 8px; box-shadow: 0 4px 8px rgba(0,0,0,0.2); }\n"
-           "  .data-item { margin: 10px 0; font-size: 18px; }\n"
-           "</style>\n"
-           "<script>\n"
-           "  function updateTurbidity() {\n"
-           "    fetch('/turbidity/data')\n"
-           "      .then(response => response.json())\n"
-           "      .then(data => {\n"
-           "        document.getElementById('turbidity').innerText = data.turbidity + ' NTU';\n"
-           "        document.getElementById('voltage').innerText = data.voltage + ' V';\n"
-           "        document.getElementById('time').innerText = new Date().toLocaleTimeString();\n"
-           "      })\n"
-           "      .catch(error => {\n"
-           "        console.error('Fout bij ophalen van turbidity data:', error);\n"
-           "      });\n"
-           "  }\n"
-           "  setInterval(updateTurbidity, 1000);\n"
-           "</script>\n"
-           "</head>\n"
-           "<body>\n"
-           "<div class='banner'>\n"
-           "<div class='svg-container'>\n"
-           "<svg viewBox='0 0 1080 100' preserveAspectRatio='xMidYMid slice' xmlns='http://www.w3.org/2000/svg' width='100%' height='100'>\n"
-           "  <rect style='fill:#ffffff;stroke:none;' width='1080' height='100' />\n"
-           "  <g transform='scale(0.5) translate(450, -90)' style='stroke:none;'>\n"
-           "    <path style='fill:#01bf63;stroke:none;' d='m 251.81923,282.83088 c 0,0 -105.37212,1.47718 0.006,-147.22529 105.3786,148.70295 0.006,147.22577 0.006,147.22577' />\n"
-           "    <path style='fill:#ffffff;stroke:none;' d='m 210.39692,266.4831 c 0,0 56.52674,5.58289 93.74598,-28.14706 37.21925,-33.72994 0.46524,-37.21924 0.46524,-37.21924 0,0 -44.89571,56.99197 -103.51603,42.80213 -58.62031,-14.18984 9.30481,22.56417 9.30481,22.56417 z' />\n"
-           "    <path style='fill:#d8d4d5;stroke:none;' d='m 185.46511,214.04958 c 0,0 -35.50385,51.25721 23.74761,54.07871 0,0 51.25721,2.35125 100.63342,-40.44147 0,0 58.45213,-54.88295 -16.27049,-64.19344 0,0 37.26464,12.18139 6.98072,49.79206 0,0 -23.44561,28.57434 -63.01009,37.61067 0,0 -68.50547,16.67025 -52.08117,-36.84653 z' />\n"
-           "    <path style='fill:#ffffff;stroke:none;' d='m 217.44432,204.23819 c 0,0 -10.03344,24.84472 -5.25562,41.88564 l 2.22966,0.31852 c 0,0 -0.47779,-16.40388 3.02596,-42.20416 z' />\n"
-           "  </g>\n"
-           "  <text style='font-size:36px;font-family:Futura;font-weight:bold;fill:#241c1c;' x='400' y='60'>\n"
-           "    <tspan style='fill:#605b56;'>Pure</tspan>\n"
-           "    <tspan style='fill:#01bf63;'>FIo</tspan>\n"
-           "  </text>\n"
-           "  <text style='font-size:12px;font-family:Futura;font-weight:bold;fill:#605b56;' x='410' y='85'>RESIN FILTERS</text>\n"
-           "</svg>\n"
-           "</div>\n"
-           "</div>\n"
-           "</body>\n"
-           "</html>\n";
+    return "<!DOCTYPE html>\
+            <html>\
+                <head>\
+                <title>ESP32 Webinterface</title>\
+                    <style>\
+                        body { font-family: Arial, sans-serif; text-align: center; margin: 0; padding: 0; background-color: #f4f4f9; }\
+                        h1 { color: #333; }\
+                        p { color: #666; font-size: 18px; }\
+                        .container { max-width: 600px; margin: auto; padding: 20px; }\
+                        button { padding: 10px 20px; font-size: 16px; color: #fff; background-color: #007BFF; border: none; border-radius: 5px; cursor: pointer; }\
+                        button:hover { background-color: #0056b3; }\
+                        .link { text-decoration: none; }\
+                        .card { margin: 20px auto; padding: 15px; border-radius: 8px; background: #fff; box-shadow: 0 4px 8px rgba(0,0,0,0.2); }\
+                        .banner { width: 100%; display: flex; justify-content: center; align-items: center; background-color: #fff; padding: 10px 0; }\
+                        .svg-container { max-width: 600px; width: 100%; }\
+                        .data-section { margin-top: 20px; padding: 15px; background-color: #ffffff; border-radius: 8px; box-shadow: 0 4px 8px rgba(0,0,0,0.2); }\
+                        .data-item { margin: 10px 0; font-size: 18px; }\
+                    </style>\
+                    <script>\
+                        function updateTurbidity() {\
+                        fetch('/turbidity/data')\
+                            .then(response => response.json())\
+                            .then(data => {\
+                            document.getElementById('turbidity').innerText = data.turbidity + ' NTU';\
+                            document.getElementById('avg_turbidity').innerText = data.avg_turbidity + ' NTU';\
+                            document.getElementById('voltage').innerText = data.voltage + ' V';\
+                            document.getElementById('avg_voltage').innerText = data.avg_voltage + ' V';\
+                            })\
+                            .catch(error => {\
+                            console.error('Fout bij ophalen van turbidity data:', error);\
+                            });\
+                        }\
+                        setInterval(updateTurbidity, 1000);\
+                    </script>\
+                </head>\
+                <body>\
+                    <div class='banner'>\
+                        <div class='svg-container'>\
+                            <svg viewBox='0 0 1080 100' preserveAspectRatio='xMidYMid slice' xmlns='http://www.w3.org/2000/svg' width='100%' height='100'>\
+                                <rect style='fill:#ffffff;stroke:none;' width='1080' height='100' />\
+                                <g transform='scale(0.5) translate(450, -90)' style='stroke:none;'>\
+                                    <path style='fill:#01bf63;stroke:none;' d='m 251.81923,282.83088 c 0,0 -105.37212,1.47718 0.006,-147.22529 105.3786,148.70295 0.006,147.22577 0.006,147.22577' />\
+                                    <path style='fill:#ffffff;stroke:none;' d='m 210.39692,266.4831 c 0,0 56.52674,5.58289 93.74598,-28.14706 37.21925,-33.72994 0.46524,-37.21924 0.46524,-37.21924 0,0 -44.89571,56.99197 -103.51603,42.80213 -58.62031,-14.18984 9.30481,22.56417 9.30481,22.56417 z' />\
+                                    <path style='fill:#d8d4d5;stroke:none;' d='m 185.46511,214.04958 c 0,0 -35.50385,51.25721 23.74761,54.07871 0,0 51.25721,2.35125 100.63342,-40.44147 0,0 58.45213,-54.88295 -16.27049,-64.19344 0,0 37.26464,12.18139 6.98072,49.79206 0,0 -23.44561,28.57434 -63.01009,37.61067 0,0 -68.50547,16.67025 -52.08117,-36.84653 z' />\
+                                    <path style='fill:#ffffff;stroke:none;' d='m 217.44432,204.23819 c 0,0 -10.03344,24.84472 -5.25562,41.88564 l 2.22966,0.31852 c 0,0 -0.47779,-16.40388 3.02596,-42.20416 z' />\
+                                </g>\
+                                <text style='font-size:36px;font-family:Futura;font-weight:bold;fill:#241c1c;' x='400' y='60'>\
+                                    <tspan style='fill:#605b56;'>Pure</tspan>\
+                                    <tspan style='fill:#01bf63;'>FIo</tspan>\
+                                </text>\
+                                <text style='font-size:12px;font-family:Futura;font-weight:bold;fill:#605b56;' x='410' y='85'>RESIN FILTERS</text>\
+                            </svg>\
+                        </div>\
+                    </div>\
+                </body>\
+            </html>";
 }
 
 // Function: HTML-footer
@@ -438,19 +552,25 @@ String getHtmlFooter() { return "</div></body></html>"; }
 void handleRoot()
 {
     String html = getHtmlHeader();
-    html += "<h1>ESP32 Webinterface</h1>\
-           <div class='card'>\
-             <p>Control the Pump state or check the turbidity values:</p>\
-             <p><a href='/pump/on' class='link'><button>Pump ON</button></a></p>\
-             <p><a href='/pump/off' class='link'><button>Pump OFF</button></a></p>\
-           </div>\
-           <div class='card'>\
-             <h2>Realtime Turbidity</h2>\
-             <p><strong>Turbidity:</strong> <span id='turbidity'>Laden...</span></p>\
-             <p><strong>Voltage:</strong> <span id='voltage'>Laden...</span></p>\
-             <p><strong>Time:</strong> <span id='time'>" + String(millis() / 1'000) + " sec</span></p>\
-             <p><a href='/wifi/reset' class='link'><button>Reset Wi-Fi Settings</button></a></p>\
-           </div>";
+    html +=
+        "<h1>ESP32 Webinterface</h1>\
+            <p>Control the Pump state or check the turbidity values:</p>\
+            <div class='card'>\
+                <h2>Pump Settings</h2>\
+                <p><a href='/pump/on' class='link'><button>Pump ON</button></a></p>\
+                <p><a href='/pump/off' class='link'><button>Pump OFF</button></a></p>\
+            </div>\
+            <div class='card'>\
+                <h2>Realtime Turbidity Data</h2>\
+                <p><strong>Turbidity:</strong> <span id='turbidity'>Laden...</span></p>\
+                <p><strong>Average Turbidity:</strong> <span id='avg_turbidity'>Laden...</span></p>\
+                <p><strong>Voltage:</strong> <span id='voltage'>Laden...</span></p>\
+                <p><strong>Average Voltage:</strong> <span id='avg_voltage'>Laden...</span></p>\
+            </div>\
+            <div class='card'>\
+                <h2>Wi-Fi Settings</h2>\
+                <p><a href='/wifi/reset' class='link'><button>Reset Wi-Fi Settings</button></a></p>\
+            </div>";
     html += getHtmlFooter();
     server.send(200, "text/html", html);
 }
@@ -459,38 +579,27 @@ void handleRoot()
 void handlePumpOn()
 {
     changePumpState(true);
-    String html = getHtmlHeader();
-    html +=
-        "<h1>Pump Status</h1>\
-           <div class='card'>\
-             <p>The pump is now <strong>ON</strong>.</p>\
-             <p><a href='/' class='link'><button>Back to Home</button></a></p>\
-           </div>";
-    html += getHtmlFooter();
-    server.send(200, "text/html", html);
+    handleRoot();
 }
 
 // Function: Webserver LED Off
 void handlePumpOff()
 {
     changePumpState(false);
-    String html = getHtmlHeader();
-    html +=
-        "<h1>Pump Status</h1>\
-           <div class='card'>\
-             <p>The pump is now <strong>OFF</strong>.</p>\
-             <p><a href='/' class='link'><button>Back to Home</button></a></p>\
-           </div>";
-    html += getHtmlFooter();
-    server.send(200, "text/html", html);
+    handleRoot();
 }
 
 // Function: Realtime Turbidity Data (JSON)
 void handleTurbidityData()
 {
-    if (get_turbidity_data(turbidity_data_ws, false, false, 4))
+    if (get_turbidity_data(false, false, 4))
     {
-        server.send(200, "application/json", turbidity_data_ws.text_data);
+        TurbidityData local_turbidity_data;
+        if (get_semaphore_turbidity_data(local_turbidity_data))
+        {
+            server.send(200, "application/json", local_turbidity_data.text_data_json);
+        }
+        else { handleRoot(); }
     }
 }
 
@@ -546,15 +655,16 @@ void update_buttons(uint16_t touch_x, uint16_t touch_y)
     bool button_off_pressed = is_button_pressed(touch_x, touch_y, 280, 220, 180, 80);
 
     bool pump_state_local;
-    if (get_pump_state(pump_state_local))
+    if (get_semaphore_pump_state(pump_state_local))
     {
         bool result = (button_on_pressed && !button_off_pressed)   ? true
                       : (button_off_pressed && !button_on_pressed) ? false
                                                                    : pump_state_local;
 
+        log_i("NEW pump state: %s", result ? "ON" : "OFF");
         changePumpState(result);
     }
-    else { log_w("get_pump_state failed!"); }
+    else { log_w("get_semaphore_pump_state failed!"); }
 }
 
 void init_motor()
@@ -591,13 +701,59 @@ void motor_task(void* parameter)
     while (true)
     {
         bool pump_state_local;
-        if (get_pump_state(pump_state_local))
+        if (get_semaphore_pump_state(pump_state_local))
         {
             if (pump_state_local) { stepper.runSpeed(); }
         }
-        else { log_w("get_pump_state failed!"); }
+        else { log_w("get_semaphore_pump_state failed!"); }
 
         vTaskDelay(1 / portTICK_PERIOD_MS);
+    }
+}
+
+void init_wifi()
+{
+    tft_text_setup(true);
+    tft.println("Starting WiFi Manager!");
+    Serial.println("Starting WiFi Manager!");
+
+    // Connect to WiFi
+    wifiManager.setConnectTimeout(WIFI_CONNECT_TIMEOUT);
+    wifiManager.setConnectRetries(WIFI_CONNECT_RETRIES);
+    wifiManager.setAPCallback(configModeCallback);
+
+    if (wifiManager.autoConnect("ESP32_ConfigPortal"))
+    {
+        wifiManager.setWiFiAutoReconnect(false);
+
+        tft_text_setup(true, 0, TFT_GREEN, TFT_BLACK);
+        WEBSERVER_IP_ADDRESS_TEXT = "Webserver IP-address:\n" + WiFi.localIP().toString();
+        tft.printf("%s\n%s", "WiFi connected!", WEBSERVER_IP_ADDRESS_TEXT.c_str());
+        Serial.printf("%s\n%s", "WiFi connected!", WEBSERVER_IP_ADDRESS_TEXT.c_str());
+    }
+    else
+    {
+        tft_text_setup(true, 0, TFT_RED, TFT_BLACK);
+        tft.printf("Failed to connect to WiFi!");
+        Serial.println("Failed to connect to WiFi!");
+    }
+}
+
+void wifi_task(void* parameter)
+{
+    Serial.println("Entering WiFi Task loop");
+    while (true)
+    {
+        if (WiFi.status() != WL_CONNECTED)
+        {
+            tft_text_setup(true, 0, TFT_RED, TFT_BLACK);
+            tft.println("WiFi disconnected!");
+            Serial.println("WiFi disconnected!");
+
+            init_wifi();
+            delay(5'000);
+        }
+        else { delay(200); }
     }
 }
 
@@ -617,8 +773,21 @@ void webserver_task(void* parameter)
     Serial.println("Entering Webserver Task loop");
     while (true)
     {
-        server.handleClient();  // Process incoming HTTP requests
-        delay(1);
+        if (WiFi.status() == WL_CONNECTED)
+        {
+            // Process incoming HTTP requests
+            server.handleClient();
+            delay(100);
+        }
+        else
+        {
+            tft_text_setup(true, 0, TFT_RED, TFT_BLACK);
+            tft.println("WiFi disconnected!");
+            Serial.println("WiFi disconnected!");
+
+            init_wifi();
+            delay(5'000);
+        }
     }
 }
 
@@ -627,13 +796,15 @@ void tft_touch_task(void* parameter)
     Serial.println("Entering TFT Touch Task loop");
     while (true)
     {
-        uint16_t        touch_x, touch_y;
+        uint16_t        raw_touch_x, raw_touch_y;
         static uint16_t prev_x, prev_y;
 
-        if (tft.getTouch(&touch_x, &touch_y))
+        if (tft.getTouch(&raw_touch_x, &raw_touch_y))
         {
-            prev_x = touch_x;
-            prev_y = touch_y;
+            uint16_t touch_x = SCREEN_INVERTED ? SCREEN_WIDTH - raw_touch_x : raw_touch_x;
+            uint16_t touch_y = SCREEN_INVERTED ? SCREEN_HEIGHT - raw_touch_y : raw_touch_y;
+            prev_x           = touch_x;
+            prev_y           = touch_y;
 
             update_buttons(prev_x, prev_y);
             display_pump_state(7);
@@ -645,21 +816,11 @@ void tft_touch_task(void* parameter)
 
 void get_data_task(void* parameter)
 {
-    for (uint16_t i = 0; i < TURBIDITY_HISTORY_SIZE; i++)
-    {
-        turbidity_data_tft.ntu.history[i]     = 0.0F;
-        turbidity_data_tft.voltage.history[i] = 0.0F;
-        turbidity_data_ws.ntu.history[i]      = 0.0F;
-        turbidity_data_ws.voltage.history[i]  = 0.0F;
-    }
-
     Serial.println("Entering Get Data Task loop");
     while (true)
     {
-        // get_turbidity_data(turbidity_data_tft, true, true, 4);  // Print turbidity data
-        get_turbidity_data(turbidity_data_tft, false, true, 4);  // Print turbidity data
-        // get_turbidity_data(turbidity_data_tft, false, false, 4);  // Print turbidity data
-        delay(2'000);
+        get_turbidity_data(false, true, 4);  // Print turbidity data
+        delay(1'000);
     }
 }
 
@@ -674,6 +835,12 @@ void setup()
 
     semaphore_pump_state = xSemaphoreCreateMutex();
     Serial.println("Created semaphore_pump_state!");
+    semaphore_manual_keep_pump_on = xSemaphoreCreateMutex();
+    Serial.println("Created semaphore_manual_keep_pump_on!");
+    semaphore_is_clean = xSemaphoreCreateMutex();
+    Serial.println("Created semaphore_is_clean!");
+    semaphore_turbidity_data = xSemaphoreCreateMutex();
+    Serial.println("Created semaphore_turbidity_data!");
 
     tft.begin();
     Serial.println("TFT Begin!");
@@ -688,29 +855,17 @@ void setup()
     digitalWrite(LED_PIN, LOW);  // Make sure the LED is off on startup
     led_state = LOW;
 
-    tft_text_setup(true);
-    tft.println("Starting WiFi Manager!");
-    Serial.println("Starting WiFi Manager!");
+    init_wifi();
 
-    // Connect to WiFi
-    wifiManager.setAPCallback(configModeCallback);
-    if (wifiManager.autoConnect("ESP32_ConfigPortal"))
-    {
-        tft_text_setup(true, 0, TFT_GREEN, TFT_BLACK);
-        WEBSERVER_IP_ADDRESS_TEXT = "Webserver IP-address:\n" + WiFi.localIP().toString();
-        tft.printf("%s\n%s", "WiFi connected!", WEBSERVER_IP_ADDRESS_TEXT.c_str());
-        Serial.printf("%s\n%s", "WiFi connected!", WEBSERVER_IP_ADDRESS_TEXT.c_str());
-    }
-
-    get_turbidity_data(turbidity_data_tft, false, true, 4);  // Print turbidity data (only on TFT display)
+    get_turbidity_data(false, true, 4);  // Print turbidity data (only on TFT display)
     display_pump_state(7);
     display_button("ON", 20, 220, 180, 80, TFT_GREEN, TFT_BLACK);
     display_button("OFF", 280, 220, 180, 80, TFT_RED, TFT_BLACK);
 
     xTaskCreatePinnedToCore(webserver_task, "webserver_task", 4096, NULL, 1, &webserver_task_handle, 0);
     xTaskCreatePinnedToCore(tft_touch_task, "tft_touch_task", 4096, NULL, 3, &tft_touch_task_handle, 0);
-    xTaskCreatePinnedToCore(get_data_task, "get_data_task", 4096, NULL, 5, &get_data_task_handle, 0);
-    xTaskCreatePinnedToCore(motor_task, "motor_task", 4096, NULL, 10, &motor_task_handle, 1);  // Main App core
+    xTaskCreatePinnedToCore(get_data_task, "get_data_task", 4096, NULL, 4, &get_data_task_handle, 0);
+    xTaskCreatePinnedToCore(motor_task, "motor_task", 4096, NULL, 2, &motor_task_handle, 1);  // Main App core
 }
 
 /** ----------------------------------------------------------------------------------------------------- 
