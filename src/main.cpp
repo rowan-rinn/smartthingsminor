@@ -131,13 +131,18 @@ constexpr const float to_voltage(uint16_t analog_value)
 constexpr const float to_ntu_raw(float voltage)
 {
 #if TURBIDITY_SENSOR_3V3
-    return (-2572.2F * sq(voltage) + 8700.5F * voltage - 4352.9F);
+    return (voltage < (TURBIDITY_SENSOR_INPUT_VOLTAGE / 2.0F) ? 3000.0F
+                                                              : (-2572.2F * sq(voltage) + 8700.5F * voltage - 4352.9F));
 #else
-    return (-1120.4F * sq(voltage) + 5742.3F * voltage - 4352.9F);
+    return (voltage < (TURBIDITY_SENSOR_INPUT_VOLTAGE / 2.0F) ? 3000.0F
+                                                              : (-1120.4F * sq(voltage) + 5742.3F * voltage - 4352.9F));
 #endif
 }
 
-constexpr const float to_ntu(float voltage) { return to_ntu_raw(voltage) < 0 ? 0 : to_ntu_raw(voltage); }
+constexpr const float to_ntu(float voltage)
+{
+    return (to_ntu_raw(voltage) < 0.0F) ? (0.0F) : (to_ntu_raw(voltage) > 3000.0F) ? (3000.0F) : to_ntu_raw(voltage);
+}
 
 template<typename T>
 bool semaphore_get(T& dest, T& src, SemaphoreHandle_t& semaphore_handle, const char* semaphore_name = "semaphore")
